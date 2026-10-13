@@ -262,6 +262,85 @@ def nearest(samples, t, key="_at"):
     return min(samples, key=lambda s: abs((s.get(key) or 0) - t))
 
 
+# --------------------------------------------------------------------------- #
+# 判据
+# --------------------------------------------------------------------------- #
+def audio_checks(add, first, last, device, args):
+    """阶段二：两路音频各自算，别让视频的绿灯替它们背书。
+
+    四个计数器，方向别搞混 —— 这正是"哪半边没通"最容易看反的地方：
+
+      board   audio_bytes_out / audio_packets_out  板子的麦克风**发**出去
+      board   audio_frames_decoded                 板子**收**进来并解出的 opus 帧
+      browser audio.inBytesReceived                A 路的落地端
+      browser audio.outBytesSent                   浏览器麦克风**发**出去
+
+    其中 board 的 audio_frames_decoded 是四个里最硬的一个：它是 opusdec
+    真的吐出了帧，不是"收到了包"。B 路出问题时的症状（板子一个中文报错
+    都没有、ICE 也 connected）见 src/pipeline.py 里 attach_audio_return
+    的说明。
+    """
+    a0 = first.get("audio")
+    a1 = last.get("audio")
+    if not a0 or not a1:
+        add("浏览器样本带音频统计", False,
+            "样本里没有 audio 字段。页面的 collectStats 要带音频那几项，"
+            "否则 A 路收没收到、麦克风有没有真的在送，都无从判断")
+        return
+
+    # ---- A 路：板子 → 浏览器 ----
+    got = (a1.get("inBytesReceived") or 0) - (a0.get("inBytesReceived") or 0)
+    lost = (a1.get("inPacketsLost") or 0) - (a0.get("inPacketsLost") or 0)
+    add("浏览器收到板子的音频", got > 0,
+        "inbound audio %d 字节（%.1f kbps），窗口内丢包 %d"
+        % (got, a1.get("inKbps") or 0, lost))
+
+    # ---- B 路：浏览器 → 板子 ----
+    # hasMicTrack 单独判：页面在 getUserMedia 失败时也能建出 PeerConnection，
+    # 那一路上行字节永远是 0，而 outBytesSent 的判据只会说"没在送"，
+    # 说不清是"没麦克风"还是"有麦克风但没接上"。
+    add("页面拿到了麦克风", bool(a1.get("hasMicTrack")),
+        "hasMicTrack=%s（页面上的「开始对讲」点了吗）" % a1.get("hasMicTrack"))
+    sent = (a1.get("outBytesSent") or 0) - (a0.get("outBytesSent") or 0)
+    add("浏览器在往板子送音频", sent > 0,
+        "outbound audio %d 字节（%.1f kbps）" % (sent, a1.get("outKbps") or 0))
+
+    # ---- A 路字节守恒：需要板子侧的发送计数 ----
+    if not device:
+        add("音频字节守恒可计算", False, "没有设备侧样本（role=device）")
+        return
+    d_start = nearest(device, first["_at"])
+    d_end = nearest(device, last["_at"])
+    d_audio = (d_end or {}).get("audio_bytes_out", 0) - \
+              (d_start or {}).get("audio_bytes_out", 0)
+    if d_audio <= 0:
+        add("音频字节守恒可计算", False,
+            "板子侧音频字节在窗口内没增长（%d）—— 板子没在发音频" % d_audio)
+    else:
+        ratio = got / d_audio
+        # **音频这条的容差必须比视频宽**，不是"数据脏"，是一处**固定的口径差**：
+        # 实测（Chrome，32kbps/20ms）板子 audio_bytes_out 是 92.00 字节/包
+        # —— 80 字节 Opus 载荷 + 12 字节 RTP 头，正好是理论值；而浏览器
+        # inbound-rtp 报的是 80.00 字节/包。80/92 = 0.870，也就是说这条判据的
+        # "完美值"本来就是 0.87 而不是 1.0，用 15% 容差去卡它只剩 2 个点余量，
+        # 一次正常抖动就能把它打成红的。
+        # 视频那边没这个问题（包大，12 字节头淹没在噪声里，实测 0.983）。
+        add("音频字节守恒 ≈ 1.0", abs(ratio - 1.0) <= args.audio_tolerance,
+            "收到/发出 = %.3f（%d / %d 字节；音频天然偏低约 0.87 —— "
+            "浏览器的音频 bytesReceived 只算载荷，板子那侧算整个 RTP 包，"
+            "容差 ±%.0f%%）"
+            % (ratio, got, d_audio, args.audio_tolerance * 100))
+
+    # ---- B 路落地：板子真的解出来了 ----
+    d_frames = (d_end or {}).get("audio_frames_decoded", 0) - \
+               (d_start or {}).get("audio_frames_decoded", 0)
+    add("板子解出了麦克风的音频帧", d_frames > 0,
+        "板端 opusdec 解出 %d 帧（窗口 %.1fs，约 %.0f 帧/秒；Opus 20ms 一帧，"
+        "满速是 50）"
+        % (d_frames, last["_at"] - first["_at"],
+           d_frames / max(1e-6, last["_at"] - first["_at"])))
+
+
 def run_checks(browser, device, args):
     checks = []
 
@@ -434,6 +513,14 @@ def run_checks(browser, device, args):
                 % (ratio, b_bytes / 1048576, d_bytes / 1048576,
                    args.tolerance * 100))
 
+    # ---- 音频（阶段二）----
+    if args.audio:
+        audio_checks(add, first, last, device, args)
+    else:
+        add("音频判据未启用", True,
+            "加 --audio 才检查音频。阶段二的验证请带上它 —— "
+            "视频的判据全都通过、音频一路都不通，是完全可能的")
+
     # ---- 播放位置：区分"源头停了"和"编不动了" ----
     t0 = first.get("srcTime")
     t1 = last.get("srcTime")
@@ -465,8 +552,19 @@ def main():
     p.add_argument("--max-gap", type=float, default=5.0,
                    help="/diag 是累积的，设备侧样本间隔超过这么多秒就当成"
                         "换了一轮会话，只分析最后一段")
+    p.add_argument("--audio", action="store_true",
+                   help="阶段二：额外检查两路音频。默认不开，因为麦克风要人手点"
+                        "页面上的「开始对讲」才会起来 —— 没点的时候音频判据"
+                        "必然全红，那是操作问题不是链路问题")
     p.add_argument("--tolerance", type=float, default=0.15,
-                   help="字节守恒的容差。旧项目实测直连是 1.00 / 0.99")
+                   help="视频字节守恒的容差。旧项目实测直连是 1.00 / 0.99")
+    p.add_argument("--audio-tolerance", type=float, default=0.20,
+                   help="音频字节守恒的容差，必须比 --tolerance 宽。不是数据脏，"
+                        "是两边口径不同：实测板子 audio_bytes_out 按 92 字节/包"
+                        "（80 字节 Opus 载荷 + 12 字节 RTP 头）算，浏览器的音频 "
+                        "inbound-rtp.bytesReceived 报 80 字节/包，所以这条判据的"
+                        "「完美值」本来就是 80/92≈0.87。用 15%% 去卡只剩 2 个点"
+                        "余量，正常抖一下就红")
     p.add_argument("--min-fps", type=float, default=12.0,
                    help="稳态帧率下限。板子实测的编码上限约 20.4fps"
                         "（720p UYVY，rkisp 吞吐限制 —— 不是 CPU，8 核负载 0.14，"

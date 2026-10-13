@@ -29,6 +29,7 @@
   button:hover:not(:disabled){ background:#39415380; }
   button:disabled{ opacity:.45; cursor:default; }
   button.on{ background:#1f4d33; border-color:var(--ok); color:var(--ok); }
+  #talkHint { color:var(--dim); font-size:12px; }
   .stage { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:12px; }
   @media (max-width:900px){ .stage{grid-template-columns:1fr} }
   video {
@@ -52,13 +53,16 @@
 
 <div class="bar">
   <span id="roomLabel">房间 —</span>
+  <button id="talkBtn">开始对讲</button>
+  <span id="talkHint">点了之后浏览器才会申请麦克风</span>
   <span id="status" class="status">未连接</span>
 </div>
 
 <div class="stage">
-  <!-- muted 先留着：浏览器的自动播放策略要求"带声音的播放"得有用户手势。
-       没有它，页面一打开视频就被拒绝播放，表现是全黑 ——
-       而原因和媒体链路毫无关系。 -->
+  <!-- muted 一开始**必须留着**：浏览器的自动播放策略要求"带声音的播放"
+       得有用户手势。没有它，页面一打开视频就被拒绝播放，表现是全黑 ——
+       而原因和媒体链路毫无关系。点「开始对讲」时那个手势同时用来解除静音。
+       （另一个坑：就是 muted 让阶段一的"听不见板子"看起来像 bug，其实不是。） -->
   <video id="video" autoplay playsinline muted></video>
   <div class="side">
     <pre id="stats">等待发布端…</pre>
@@ -94,6 +98,10 @@ const PAGE_VERSION = "2026-10-14.2";
 
 let lastStats = null;         // 最近一次完整样本，供 diag 上报
 const pendingCandidates = []; // setRemoteDescription 之前到达的候选先缓存
+
+// 浏览器的麦克风。**必须在 setRemoteDescription 之前**加进 pc —— 见 startTalk
+// 和 createPc 里的说明，这是阶段二最容易踩的一个顺序问题。
+let micStream = null;
 
 /* ---------------------------------------------------------------- 工具 */
 function log(msg) {
@@ -154,6 +162,26 @@ async function loadIceServers() {
 function createPc() {
   pc = new RTCPeerConnection({ iceServers, bundlePolicy:"max-bundle" });
 
+  /* 麦克风音轨必须在**任何 setRemoteDescription 之前**加进来。
+     这是踩过的顺序问题：等协商完了再 addTrack，浏览器只会标记"需要重新协商"，
+     而本方案是单次 offer、不重协商（见 docs），于是那一路上永远停在 recvonly ——
+     症状是"浏览器这边显示在发，板子一点声音都没有"，两边都不报错。
+     addTrack（带 track）默认方向就是 sendrecv；下面再显式写一次，
+     是因为 addTransceiver 不带 track 时默认是 recvonly，两种 API 容易记混。 */
+  if (micStream) {
+    const track = micStream.getAudioTracks()[0];
+    if (track) {
+      pc.addTrack(track, micStream);
+      const tx = pc.getTransceivers().slice(-1)[0];
+      if (tx) {
+        try { tx.direction = "sendrecv"; }
+        catch (e) { log("设 transceiver.direction 失败: " + e.message); }
+      }
+      log(`已把麦克风音轨加进 PeerConnection（track=${track.label}，`
+          + `方向=${tx ? tx.direction : "?"}）`);
+    }
+  }
+
   pc.ontrack = (ev) => {
     log(`ontrack: kind=${ev.track.kind}`);
     if (ev.streams && ev.streams[0]) {
@@ -212,10 +240,12 @@ function teardownPc() {
 
 /* 把板子 offer 里的 m-line 和方向打出来。
 
-   方向这几个值在浏览器里**都不报错**，只有这一行 SDP 说得清：
-     sendonly  板子只发（视频这一路就该是这个）
-     recvonly  板子只收
-     sendrecv  双向 */
+   阶段二最想确认的一件事就是音频那一路协商成了什么方向，而这三个值在浏览器里
+   **都不报错**，只有这一行 SDP 说得清：
+     sendrecv  双向都通
+     sendonly  板子只发 → 听得到板子，板子听不到你
+     recvonly  板子只收 → 板子听得到你，你听不到板子
+   （旧项目就踩过 addTransceiver 协商成 recvonly 的坑。） */
 function logOfferMedia(sdp) {
   const lines = (sdp || "").split(/\r?\n/).map((l) => l.trim());
   const mIdx = [];
@@ -232,6 +262,10 @@ function logOfferMedia(sdp) {
     log(`  offer m-line[${k}] ${lines[start]}  方向=${dir}`);
   });
 
+  log(lines.some((l) => /^a=rtpmap:\d+ opus\/48000/i.test(l))
+      ? "  offer 里有 opus/48000 —— 板子那路麦克风已经在推了"
+      : "  !! offer 里没有 opus/48000：板子侧音频分支没建起来。"
+        + "去看它的启动日志，多半是 AudioUnavailable 或者用了 --no-audio");
 }
 
 /* ------------------------------------------------------------ 连接流程 */
@@ -350,9 +384,14 @@ async function collectStats() {
   const report = await pc.getStats();
 
   let inbound = null, transport = null;
+  // 音频单独取。**不能拿视频的数字给音频背书** —— 两路的失败方式完全独立
+  // （一个坏在摄像头/编码器，一个坏在 ALSA 设备名），一起算就分不出来了。
+  let audioIn = null, audioOut = null;
   const pairs = [];
   report.forEach((r) => {
     if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
+    if (r.type === "inbound-rtp" && r.kind === "audio") audioIn = r;
+    if (r.type === "outbound-rtp" && r.kind === "audio") audioOut = r;
     if (r.type === "transport" && transport === null) transport = r;
     if (r.type === "candidate-pair") pairs.push(r);
   });
@@ -382,7 +421,7 @@ async function collectStats() {
   if (!inbound) { statsEl.textContent = "尚未收到视频流…"; return; }
 
   const now = inbound.timestamp;
-  let fps = "—", kbps = "—", pairRate = "—";
+  let fps = "—", kbps = "—", pairRate = "—", aInKbps = "—", aOutKbps = "—";
   if (prevSample && now > prevSample.timestamp) {
     const dt = (now - prevSample.timestamp) / 1000;
     fps = ((inbound.framesDecoded - prevSample.framesDecoded) / dt).toFixed(1);
@@ -392,13 +431,32 @@ async function collectStats() {
       pairRate = (((pair.bytesReceived - prevSample.pairBytes) / dt) / 1024)
                    .toFixed(0) + " KiB/s";
     }
+    // 音频速率是**双向**的两个数，且都按 kbps 保留一位 —— Opus 32kbps 的量级
+    // 用整数就没分辨率了，看不出"从 32 掉到 3"这种（那正是断流的信号）。
+    if (audioIn && prevSample.audioInBytes != null) {
+      aInKbps = (((audioIn.bytesReceived - prevSample.audioInBytes) * 8) / dt / 1000)
+                  .toFixed(1);
+    }
+    if (audioOut && prevSample.audioOutBytes != null) {
+      aOutKbps = (((audioOut.bytesSent - prevSample.audioOutBytes) * 8) / dt / 1000)
+                   .toFixed(1);
+    }
   }
   prevSample = {
     timestamp: now,
     framesDecoded: inbound.framesDecoded,
     bytesReceived: inbound.bytesReceived,
     pairBytes: pair ? pair.bytesReceived : null,
+    audioInBytes: audioIn ? audioIn.bytesReceived : null,
+    audioOutBytes: audioOut ? audioOut.bytesSent : null,
   };
+
+  // 三态要说清，不能都显示成 0：这一路**根本不存在**（没协商上）、
+  // 存在但没数据（协商了没人发）、和在正常发，是三件要查不同地方的事。
+  const aLine = (r, unit) => !r ? "（这一路不存在）"
+      : `${unit === "in" ? aInKbps : aOutKbps} kbps  `
+        + `累计 ${((unit === "in" ? r.bytesReceived : r.bytesSent) / 1024).toFixed(0)} KiB`
+        + (unit === "in" ? `  丢包 ${r.packetsLost || 0}` : "");
 
   statsEl.textContent =
     `分辨率      ${inbound.frameWidth || "?"} x ${inbound.frameHeight || "?"}\n` +
@@ -409,7 +467,11 @@ async function collectStats() {
     `抖动        ${inbound.jitter != null ? (inbound.jitter*1000).toFixed(1)+" ms" : "—"}\n` +
     `候选对速率  ${pairRate}\n` +
     `播放位置    ${video.currentTime.toFixed(1)} s\n` +
-    `连接状态    ${pc.connectionState} / ICE ${pc.iceConnectionState}`;
+    `连接状态    ${pc.connectionState} / ICE ${pc.iceConnectionState}\n` +
+    `—— 音频 ——\n` +
+    `板→浏览器   ${aLine(audioIn, "in")}\n` +
+    `浏览器→板   ${aLine(audioOut, "out")}\n` +
+    `浏览器麦克风 ${micStream ? "已开" : "未开（点「开始对讲」）"}`;
 
   // 板子发来的 offer 就在 remoteDescription 里 —— 它才是"板子愿意给什么"的
   // 权威来源。看 nackCount=0 只能知道"浏览器没发过重传请求"，说明不了
@@ -482,6 +544,24 @@ async function collectStats() {
       framesPerSecond: inbound.framesPerSecond,
       jitterBufferDelay: inbound.jitterBufferDelay,
       jitterBufferEmittedCount: inbound.jitterBufferEmittedCount,
+    },
+    // 音频这两个方向分开报。**"进"通了不代表"出"通了** ——
+    // "出"那一路（浏览器的麦克风）是最容易单向半通的一段：轨没在
+    // setRemoteDescription 之前加进去时，浏览器这边照样显示"在发"，
+    // 但板子上一个 opus 帧都解不出来。判据必须两边对得上才算过。
+    audio: {
+      inBytesReceived: audioIn ? audioIn.bytesReceived : null,
+      inPacketsReceived: audioIn ? audioIn.packetsReceived : null,
+      inPacketsLost: audioIn ? (audioIn.packetsLost || 0) : null,
+      inKbps: aInKbps === "—" ? null : Number(aInKbps),
+      // totalAudioEnergy 是"真有声音"而不是"真有包"的区分依据：
+      // 板子 3.5mm 口插的是三极耳机时，那一路上会稳定地流着本底噪声，
+      // 包和字节都正常增长，只有能量接近于 0。Chrome 有，Firefox 不实现。
+      inTotalAudioEnergy: audioIn ? audioIn.totalAudioEnergy : undefined,
+      outBytesSent: audioOut ? audioOut.bytesSent : null,
+      outPacketsSent: audioOut ? audioOut.packetsSent : null,
+      outKbps: aOutKbps === "—" ? null : Number(aOutKbps),
+      hasMicTrack: !!(micStream && micStream.getAudioTracks().length),
     },
     selectedPair: pair ? {
       id: pair.id,
@@ -575,6 +655,83 @@ async function dumpIce() {
   iceEl.textContent = out;
 }
 
+/* ------------------------------------------------------------ 对讲（阶段二）
+
+   浏览器 → 板子 这一路要拿麦克风，而 getUserMedia 只在**安全上下文**里存在。
+   非安全上下文（http://192.168.x.x）下 navigator.mediaDevices 直接是
+   **undefined** —— 不是抛异常，是压根没有这个对象。所以下面对它显式检查并说清
+   原因，而不是等它 TypeError 出来一句"cannot read property of undefined"。
+   表现极具迷惑性：视频一切正常，麦克风永远拿不到。
+
+   另外那个按钮的点击手势还兼职解除视频静音：自动播放策略要求"带声音的播放"
+   必须由用户手势触发，所以 <video> 一开始只能是 muted（见页面里那段注释）。 */
+async function startTalk() {
+  const btn = $("talkBtn"), hint = $("talkHint");
+
+  if (micStream) {                       // 再点一次 = 挂断
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+    btn.classList.remove("on");
+    btn.textContent = "开始对讲";
+    hint.textContent = "已停止。再点一次重新申请麦克风";
+    log("已释放麦克风，重连以撤掉音轨…");
+    reconnect();
+    return;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    hint.textContent = "当前页面不是安全上下文，拿不到麦克风";
+    log("!! navigator.mediaDevices 不存在。getUserMedia 只在 https（或 "
+        + "localhost）下可用，当前是 " + location.protocol + "//" + location.host
+        + "。请改用板子的 https 地址打开（见 tools/run-web.sh），"
+        + "并接受一次自签证书的警告。视频不受影响，只有对讲需要。");
+    return;
+  }
+
+  btn.disabled = true;
+  hint.textContent = "正在申请麦克风…";
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // 主要回声在浏览器这一侧，由这里的 AEC 处理就够了 ——
+        // 板子接的是耳麦，扬声器那点声漏回麦克风的量很小，所以板端
+        // **不挂 webrtcdsp**（原因见 docs/architecture.md）。
+        // 哪天把板子改成外放音箱，就得把 webrtcdsp 加回板端。
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (e) {
+    btn.disabled = false;
+    hint.textContent = "麦克风申请失败：" + e.name;
+    // NotAllowedError 可能真是用户点了拒绝，也可能是页面不在安全上下文 ——
+    // Chrome 对后者的报错也是这个名字，所以别一口咬定是用户拒绝。
+    log(`getUserMedia 失败: ${e.name} ${e.message}`
+        + (e.name === "NotAllowedError"
+           ? "（可能是用户拒绝，也可能是页面不在安全上下文里）" : ""));
+    return;
+  }
+
+  const track = micStream.getAudioTracks()[0];
+  log(`拿到麦克风: ${track ? track.label : "?"}`);
+  // 这个手势同时解除静音。单独一行是因为它和音轨是两件事：
+  // 少了它，板子那边一路正常推流，你这边只有画面没有声音。
+  video.muted = false;
+  log("视频已解除静音 —— 板子麦克风的声音从这里出来");
+
+  btn.disabled = false;
+  btn.classList.add("on");
+  btn.textContent = "停止对讲";
+  hint.textContent = "对讲中：板子能听见你，你能听见板子";
+
+  // **必须重连**，不能就地 addTrack。板子是单次 offer、不重协商（整个简化
+  // 方案就建在这上面），而这个 pc 早协商完了。重连走一遍完整的 offer/answer，
+  // 新 offer 和我们的 answer 里自然就带上音频那一路。
+  log("重连以把麦克风音轨带进这次协商…");
+  reconnect();
+}
+
 /* 拆掉当前会话再连一次。
    ws.onclose 本来也会 teardownPc，但这里显式做一遍，不依赖回调时序；
    而关旧的 ws 之前先摘掉 onclose，否则它会再触发一次 setStatus("已断开")，
@@ -594,7 +751,18 @@ function reconnect() {
 /* ---------------------------------------------------------------- 启动 */
 window.addEventListener("beforeunload", () => send({ type:"bye" }));
 
+// 按钮在这里挂，不是在 startTalk 里自己挂自己 —— 一个函数不该顺便管接线。
+$("talkBtn").addEventListener("click", () => {
+  startTalk().catch((e) => log("startTalk 抛异常: " + e.message));
+});
+
 log(`页面来自 ${location.host}，自动连接…`);
+// 提前说一句，免得用户以为对讲坏了。这里只提示，不阻止连接 ——
+// 视频在 http 下完全正常。
+if (!window.isSecureContext) {
+  log("注意：当前不是安全上下文（" + location.protocol + "），浏览器不会给麦克风，"
+      + "对讲用不了。用板子的 https 地址打开就有。视频不受影响。");
+}
 connect();
 </script>
 </body>

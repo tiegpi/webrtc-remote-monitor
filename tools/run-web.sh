@@ -1,5 +1,9 @@
 #!/bin/bash
-# 板子侧的观看页服务。浏览器开 http://<板子IP>:8080/
+# 板子侧的观看页服务。浏览器开 https://<板子IP>:8443/
+#
+# 为什么是 https：阶段二的浏览器麦克风（getUserMedia）只在**安全上下文**里存在。
+# http:// 下 navigator.mediaDevices 是 undefined，连调用机会都没有。
+# 证书是自签的（tools/gen_cert.sh 生成），浏览器第一次要接受一次。
 #
 # 这个脚本不需要 bash -l：web_server.py 不碰 GStreamer，和 tools/run-agent.sh 不一样。
 #
@@ -20,11 +24,18 @@ if [ -f .env ]; then . ./.env; fi
 : "${ROOM:?没设 ROOM —— cp .env.example .env 填上，或 export ROOM=...}"
 : "${SIGNAL_HOST:?没设 SIGNAL_HOST —— 信令服务器主机名，见 .env.example}"
 
-PORT=8080
+PORT=8443
+
+if [ ! -s certs/board.crt ] || [ ! -s certs/board.key ]; then
+    echo "缺证书。先跑一次 tools/gen_cert.sh" >&2
+    exit 1
+fi
 
 exec python3 src/web_server.py \
     --port "$PORT" \
     --room "$ROOM" \
     --signal "https://$SIGNAL_HOST" \
     --tls-ca vps-self.crt \
+    --tls-cert certs/board.crt \
+    --tls-key certs/board.key \
     "$@"

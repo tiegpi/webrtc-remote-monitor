@@ -34,6 +34,7 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 from gi.repository import GLib
 
+import audio             # 音频设备探测：判错设备不会报错，只会推一路本底噪声
 import camera            # 画质兜底：板子没有 3A，亮度只能自己闭环
 import pipeline          # 必须早于 Gst.init()：它会在导入时清掉 BSP 埋的环境变量
 import whitebalance      # 画质兜底：同一根因的另一半 —— ISP 没跑 AWB，画面偏绿
@@ -321,6 +322,15 @@ async def run_publisher(args):
     log.info("摄像头 %s  %dx%d@%d  %s  %d kbps",
              args.camera, args.width, args.height, args.fps,
              pipeline.VIDEO_FORMAT, args.bitrate // 1000)
+    if args.no_audio:
+        log.info("音频已关闭（--no-audio）：只推视频，和阶段一一样")
+    else:
+        log.info("麦克风 %s  → 浏览器（Opus %d kbps）",
+                 args.mic_device, args.audio_bitrate // 1000)
+        log.info("扬声器 %s  ← 浏览器", args.spk_device)
+        log.warning("  播放功放开关（hp switch）的回读**不可信**：写 on 会报成功"
+                    "但读回来仍是 off。有没有声音只能用耳朵确认："
+                    "tools/check_audio.sh --tone")
     if pipeline.LIBV4L2_WAS_FORCED:
         log.info("已清掉 GST_V4L2_USE_LIBV4L2（BSP 在登录 shell 里导出它，"
                  "留着会让 rkisp 分配缓冲失败）")
@@ -402,6 +412,22 @@ def parse_args(argv=None):
                    help="修偏绿（ISP 没跑 AWB）。不带值=自校准（灰世界，前 15 帧）；"
                         "也可以直接给 \"R,B\" 两个增益，如 1.71,1.55。不给就不校正")
 
+    s = p.add_argument_group(
+        "音频（阶段二）。不给设备就自动探测，探测顺序见 src/audio.py")
+    s.add_argument("--mic-device", default=None,
+                   help="采集设备（ALSA 名，如 hw:3,0）。不给就自动探测："
+                        "四极耳麦（Headset Mic Jack=on）优先，否则用 USB 采集卡；"
+                        "都没有就**明确报错**，不会静默录一路本底噪声")
+    s.add_argument("--spk-device", default=None,
+                   help="播放设备，默认 3.5mm 那一路。注意板子的播放功放开关"
+                        "（hp switch）回读不可信，用 tools/check_audio.sh --tone "
+                        "靠耳朵确认有没有声音")
+    s.add_argument("--audio-bitrate", type=int, default=32000,
+                   help="Opus 目标码率(bps)。语音 32k 足够，再高对语音没意义")
+    s.add_argument("--no-audio", action="store_true",
+                   help="完全不做音频，退化成阶段一的行为。"
+                        "没有麦克风又想演示视频时用这个")
+
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -428,6 +454,16 @@ def main(argv=None):
         problem = whitebalance.check_available()
         if problem:
             log.error("--camera-wb 用不了：%s", problem)
+            return 2
+
+    # 音频设备在**启动时**定下来，不是每次建 pipeline 时：公网模式下每来一个
+    # 观看端就会建一条 pipeline，拖到那时候才发现"没麦克风"会按观看者数重复报错，
+    # 而且报在观看端接入之后，看起来像是接入流程坏了。
+    if not args.no_audio:
+        try:
+            audio.resolve(args, log)
+        except audio.AudioUnavailable as exc:
+            log.error("%s", exc)
             return 2
 
     # 画质兜底放在最前面：此刻还没有观看端、pipeline 还没建，摄像头是空的，

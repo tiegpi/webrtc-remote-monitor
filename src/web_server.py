@@ -21,7 +21,8 @@ web_server.py —— 板子侧的观看页服务
   fetch() 拿到不受信任的证书直接 reject，WebSocket 连个提示都没有，
   而地址栏那种"点继续前往"的交互在 XHR/WS 上根本不存在。
   让板子去连 VPS（它已经用 --tls-ca 明确信任了那张证书），浏览器这一侧
-  就只剩板子一个来源，不用在两台机器上各点一次。
+  就只剩板子一个来源：阶段二给板子加 HTTPS 时，也只需要接受板子一张证书，
+  安全上下文和信令一并解决，不用在两台机器上各点一次。
 
 路由：
     /                      monitor.html
@@ -285,6 +286,9 @@ def parse_args(argv=None):
                         "对不上的连接会被 bad-room 直接关掉")
     p.add_argument("--tls-ca", default=None,
                    help="信令服务器用自签证书时，把那张证书的路径给它")
+    t = p.add_argument_group("本服务的 TLS（阶段二浏览器要麦克风时才需要）")
+    t.add_argument("--tls-cert", default=None, help="证书链 PEM")
+    t.add_argument("--tls-key", default=None, help="私钥 PEM")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -297,9 +301,10 @@ def main(argv=None):
         datefmt="%H:%M:%S",
     )
 
+    scheme = "https" if args.tls_cert else "http"
     ip = args.host if args.host != "0.0.0.0" else guess_local_ip()
     log.info("观看页服务启动")
-    log.info("  浏览器开这个: http://%s:%d/", ip, args.port)
+    log.info("  浏览器开这个: %s://%s:%d/", scheme, ip, args.port)
     log.info("  信令转发到  : %s", args.signal)
     if args.room:
         log.info("  房间号      : %s（已通过 /config.json 告诉页面，不用手写 ?room=）",
@@ -308,8 +313,17 @@ def main(argv=None):
         log.warning("  房间号      : 没给 --room。页面会退回写死的默认值，"
                     "多半连不上 —— 请在命令行补上，值要和 device_agent.py 的一致")
     log.info("  媒体不经过本服务，是浏览器和板子之间直连的")
+    if args.tls_cert:
+        log.info("  浏览器第一次打开会拦自签证书，点一次「继续前往 / 接受风险」即可")
 
-    web.run_app(build_app(args), host=args.host, port=args.port, print=None)
+    ssl_ctx = None
+    if args.tls_cert:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        log.info("已启用 HTTPS（浏览器会需要接受一次自签证书）")
+
+    web.run_app(build_app(args), host=args.host, port=args.port,
+                ssl_context=ssl_ctx, print=None)
     return 0
 
 

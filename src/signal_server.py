@@ -14,17 +14,22 @@ STUN/TURN 配置。**媒体本身不经过这里**（除非走 TURN 中继，那
 两个部署位置，同一个文件：
 
     局域网   跑在**板子上**。板子和浏览器同网段，host candidate 直接连通，
-             --ice-mode none 就够，不需要 STUN/TURN
+             --ice-mode none 就够，不需要 STUN/TURN，也不需要证书就能看视频
+             （浏览器要麦克风时才需要 --tls-cert，见 docs/architecture.md）
     公网     跑在 VPS 上，配 --public-ip 和 coturn，走 --ice-mode turn
 
 用法：
     # 局域网（板子上）
     python3 src/signal_server.py --room demo --token hunter2 --ice-mode none
 
+    # 局域网 + 自签 HTTPS（浏览器要用麦克风时必须）
+    python3 src/signal_server.py --room demo --token hunter2 --ice-mode none \\
+        --tls-cert certs/board.crt --tls-key certs/board.key
+
     # 公网（VPS）
     python3 src/signal_server.py --public-ip 1.2.3.4 --turn-secret <hex>
 
-浏览器打开 http://<主机>:<端口>/?room=demo
+浏览器打开 http(s)://<主机>:<端口>/?room=demo
 """
 
 import argparse
@@ -37,6 +42,7 @@ import hmac
 import json
 import logging
 import secrets
+import ssl
 import sys
 import time
 from pathlib import Path
@@ -437,6 +443,10 @@ def parse_args():
     p.add_argument("--token", default="demo",
                    help="发布端鉴权用。浏览器侧不需要（连接即身份）")
 
+    t = p.add_argument_group("TLS（浏览器要麦克风时必需）")
+    t.add_argument("--tls-cert", default=None, help="证书链 PEM 路径")
+    t.add_argument("--tls-key", default=None, help="私钥 PEM 路径")
+
     i = p.add_argument_group("ICE")
     i.add_argument("--ice-mode", default="none", choices=["none", "stun", "turn"],
                    help="none = 只发空配置（局域网）；stun = 只发 STUN；"
@@ -474,6 +484,17 @@ def quiet_ws_reset(loop):
     loop.set_exception_handler(handler)
 
 
+def build_ssl_context(args):
+    if not args.tls_cert and not args.tls_key:
+        return None
+    if not (args.tls_cert and args.tls_key):
+        print("--tls-cert 和 --tls-key 必须同时给", file=sys.stderr)
+        sys.exit(2)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(args.tls_cert, args.tls_key)
+    return ctx
+
+
 async def _serve(args):
     quiet_ws_reset(asyncio.get_running_loop())
     app = web.Application()
@@ -488,9 +509,11 @@ async def _serve(args):
     app.router.add_route("*", "/diag", handle_diag)
     app.router.add_post("/diag/clear", handle_diag_clear)
 
+    ssl_ctx = build_ssl_context(args)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, args.host, args.port)
+    site = web.TCPSite(runner, args.host, args.port, ssl_context=ssl_ctx)
     try:
         await site.start()
     except OSError as exc:
@@ -501,8 +524,8 @@ async def _serve(args):
                   % (args.port, args.port), file=sys.stderr)
         return 1
 
-    scheme = "http"
-    ws_scheme = "ws"
+    scheme = "https" if ssl_ctx else "http"
+    ws_scheme = "wss" if ssl_ctx else "ws"
     ice_note = {
         "none": "无（局域网，只用 host candidate）",
         "stun": "仅 STUN %s:%d" % (args.public_ip, args.turn_port),
@@ -524,6 +547,7 @@ async def _serve(args):
   房间           : {args.room}
   发布端 token   : {args.token}
   ICE            : {ice_note}
+  TLS            : {args.tls_cert or "关闭（浏览器将无法获取麦克风）"}
 
   观看页面:
     {scheme}://{args.public_ip or "<本机IP>"}:{args.port}/?room={args.room}
@@ -533,8 +557,8 @@ async def _serve(args):
         --room {args.room} --token {args.token}
 
   自检:
-    curl {scheme}://127.0.0.1:{args.port}/healthz
-    curl {scheme}://127.0.0.1:{args.port}/ice.json
+    curl {'-k ' if ssl_ctx else ''}{scheme}://127.0.0.1:{args.port}/healthz
+    curl {'-k ' if ssl_ctx else ''}{scheme}://127.0.0.1:{args.port}/ice.json
 {warn}
   Ctrl-C 退出
 ============================================================

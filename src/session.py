@@ -62,6 +62,7 @@ class DeviceSession:
         self.pipeline = None
         self.webrtcbin = None
         self.wb = None                   # 白平衡桥（--camera-wb 没开时是 None）
+        self.audio_elements = None       # 回程链（浏览器→扬声器），建好前是 None
         self.stopped = False
 
         # 统计量。读它们的是 1Hz 遥测和 tools/analyze_diag.py。
@@ -70,9 +71,20 @@ class DeviceSession:
         self.n_packets_out = 0
         self.n_bytes_out = 0
 
+        # 音频单独算，四个数分两个方向。视频通了**不代表**音频通了 ——
+        # 这两路的失败方式完全独立（一个是摄像头/编码器，一个是 ALSA 设备名），
+        # 所以判据也必须分开，不能拿视频的数字替音频背书。
+        #   出：板子 → 浏览器（麦克风那一路）
+        #   入：浏览器 → 板子（扬声器那一路），frames_decoded 是硬证据 ——
+        #       它非零说明浏览器的麦克风音频真的解出来了，而不是只有 RTP 到了
+        self.n_audio_packets_out = 0
+        self.n_audio_bytes_out = 0
+        self.n_audio_frames_decoded = 0
+
     # ---------------- 生命周期 ----------------
     def start(self):
-        self.pipeline, self.webrtcbin, self.wb = pipeline.build(self.args, self.ice, log)
+        self.pipeline, self.webrtcbin, self.wb = pipeline.build(
+            self.args, self.ice, log, on_audio_elements=self._on_audio_elements)
 
         # 顺序有讲究：先接 on-ice-candidate / on-negotiation-needed，
         # 再 set_state(PLAYING)。反过来的话首次协商会因为没人接
@@ -151,6 +163,13 @@ class DeviceSession:
             return
         pay.get_static_pad("src").add_probe(_RTP_PROBE_TYPES, self._count_out)
 
+        # 音频出口同理，打在 rtpopuspay 的 src 上 —— 和浏览器 getStats() 里
+        # kind=audio 的 inbound-rtp.bytesReceived 是同一个口径。
+        apay = self.pipeline.get_by_name("apay")
+        if apay is not None:
+            apay.get_static_pad("src").add_probe(
+                _RTP_PROBE_TYPES, self._count_audio_out)
+
     def _count_out(self, _pad, info):
         # streaming 线程上跑。只做自增，绝不在这里拿锁或记日志。
         #
@@ -175,11 +194,51 @@ class DeviceSession:
             self.n_bytes_out += buf.get_size()
         return Gst.PadProbeReturn.OK
 
+    def _count_audio_out(self, _pad, info):
+        """音频出口的计数。坑和 _count_out 完全一样，见上面的说明。"""
+        if info.type & Gst.PadProbeType.BUFFER_LIST:
+            bl = info.get_buffer_list()
+            if bl is not None:
+                self.n_audio_packets_out += bl.length()
+                self.n_audio_bytes_out += bl.calculate_size()
+            return Gst.PadProbeReturn.OK
+
+        buf = info.get_buffer()
+        if buf is not None:
+            self.n_audio_packets_out += 1
+            self.n_audio_bytes_out += buf.get_size()
+        return Gst.PadProbeReturn.OK
+
+    def _on_audio_elements(self, elements):
+        """回程链建好了（在 GLib 线程被 pipeline.attach_audio_return 调用）。
+
+        在这里给 opusdec 挂解码计数：这是"浏览器的麦克风真的到了板子"的**硬证据**。
+        光看 RTP 字节增长不够 —— 打包/解包任一端配错都可能字节在涨而一帧没解出来，
+        症状是"浏览器显示在发，板子一点声音都没有"。
+        """
+        self.audio_elements = elements
+        dec = elements.get("adec")
+        if dec is None:
+            log.warning("回程链里没有 adec，浏览器→板子的音频无法计数")
+            return
+        dec.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._count_decoded)
+        log.info("回程链已就绪，opusdec 探针已挂上")
+
+    def _count_decoded(self, _pad, info):
+        # 同样跑在 streaming 线程上，只自增。
+        if info.get_buffer() is not None:
+            self.n_audio_frames_decoded += 1
+        return Gst.PadProbeReturn.OK
+
     def counters(self):
         """给遥测用的快照。"""
         return {
             "video_packets_out": self.n_packets_out,
             "video_bytes_out": self.n_bytes_out,
+            "audio_packets_out": self.n_audio_packets_out,
+            "audio_bytes_out": self.n_audio_bytes_out,
+            "audio_frames_decoded": self.n_audio_frames_decoded,
         }
 
     # ---------------- GStreamer 总线 ----------------
