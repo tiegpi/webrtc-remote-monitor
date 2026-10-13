@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>远程监视</title>
+<style>
+  :root {
+    --bg:#14161a; --panel:#1e2128; --line:#2e3340;
+    --fg:#e6e8ee; --dim:#9aa3b2; --ok:#3ddc84; --warn:#ffb020; --err:#ff5c5c;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:16px; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  h1 { font-size:17px; margin:0 0 12px; font-weight:600; }
+  .bar {
+    display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px; margin-bottom:12px;
+  }
+  .status { margin-left:auto; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .status.ok{color:var(--ok)} .status.warn{color:var(--warn)} .status.err{color:var(--err)}
+  button {
+    background:#2b3140; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:6px 14px; font:inherit; cursor:pointer;
+  }
+  button:hover:not(:disabled){ background:#39415380; }
+  button:disabled{ opacity:.45; cursor:default; }
+  button.on{ background:#1f4d33; border-color:var(--ok); color:var(--ok); }
+  .stage { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:12px; }
+  @media (max-width:900px){ .stage{grid-template-columns:1fr} }
+  video {
+    width:100%; aspect-ratio:16/9; background:#000; display:block;
+    border:1px solid var(--line); border-radius:8px;
+  }
+  .side { display:flex; flex-direction:column; gap:8px; min-width:0; }
+  pre {
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:10px 12px; margin:0; color:var(--dim); overflow:auto;
+    font:12px/1.6 ui-monospace,"Cascadia Mono",Consolas,monospace; white-space:pre-wrap;
+  }
+  #stats { min-height:150px; }
+  #ice { flex:1; max-height:300px; white-space:pre; }
+  #log { height:150px; margin-top:12px; word-break:break-all; }
+</style>
+</head>
+<body>
+
+<h1>远程监视</h1>
+
+<div class="bar">
+  <span id="roomLabel">房间 —</span>
+  <span id="status" class="status">未连接</span>
+</div>
+
+<div class="stage">
+  <!-- muted 先留着：浏览器的自动播放策略要求"带声音的播放"得有用户手势。
+       没有它，页面一打开视频就被拒绝播放，表现是全黑 ——
+       而原因和媒体链路毫无关系。 -->
+  <video id="video" autoplay playsinline muted></video>
+  <div class="side">
+    <pre id="stats">等待发布端…</pre>
+    <pre id="ice">连接后自动显示 ICE 详情。</pre>
+  </div>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), logEl = $("log"), statsEl = $("stats");
+const statusEl = $("status"), iceEl = $("ice");
+
+// 房间号：URL 上的 ?room= 优先，没给就问板子要（见 resolveRoom）。
+// **不能在这里写死默认值** —— 信令服务器只认它配置的那一个房间，页面写死的值
+// 一旦和板子 device_agent 的 --room 对不上，服务器会回 bad-room 然后直接关连接：
+// 表现是"打开页面什么都没发生"，板子日志干干净净，浏览器这边也只有一句已断开。
+let room = new URLSearchParams(location.search).get("room") || null;
+$("roomLabel").textContent = room ? "房间 " + room : "房间 …";
+
+let pc = null, ws = null, statsTimer = null, diagTimer = null;
+let prevSample = null;        // 上一次采样，用来算码率/帧率的增量
+let iceServers = [];          // 从 /ice.json 拿到的 STUN/TURN 配置
+// 页面版本号，跟着每一份 diag 样本上报。
+// 加这个是因为踩过一次：改了页面、让用户刷新，用户也以为刷了，但拿回来的
+// 样本里新字段是空的 —— 分不清是"用户没刷"、"浏览器吃了缓存"还是"我字段名
+// 写错了"。有了版本号，样本自己就说得出跑的是哪版 JS，不用再靠 md5 猜。
+// 每次改这个文件都要动这里。
+const PAGE_VERSION = "2026-10-14.2";
+
+let lastStats = null;         // 最近一次完整样本，供 diag 上报
+const pendingCandidates = []; // setRemoteDescription 之前到达的候选先缓存
+
+/* ---------------------------------------------------------------- 工具 */
+function log(msg) {
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12:false });
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+}
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+/* -------------------------------------------------------------- 房间号 */
+/* 板子的 web_server 在 /config.json 里给出它服务的房间号。问它要，而不是写死：
+   板子上的 device_agent 按自己的 --room 发布，两边必须一致，而唯一知道这个值的
+   就是板子自己。问不到就退回 "demo" 并**大声说出来** —— 静默用一个大概率错的
+   房间号，只会把问题推到信令服务器那边去。 */
+async function resolveRoom() {
+  if (room) { log(`房间号取自 URL：${room}`); return room; }
+  try {
+    const r = await fetch("./config.json", { cache: "no-store" });
+    if (r.ok) {
+      const cfg = await r.json();
+      if (cfg.room) { room = cfg.room; log(`板子告诉页面房间号：${room}`); }
+    }
+  } catch (e) {
+    log("取 /config.json 失败（" + e.message + "）");
+  }
+  if (!room) {
+    room = "demo";
+    log("!! 板子没给出房间号，退回写死的 \"demo\"。"
+        + "板子的 device_agent 多半不是发到这个房间，请显式带上 ?room=xxx");
+  }
+  $("roomLabel").textContent = "房间 " + room;
+  return room;
+}
+
+/* ------------------------------------------------------------ ICE 配置 */
+async function loadIceServers() {
+  try {
+    const r = await fetch("./ice.json", { cache:"no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    iceServers = (await r.json()).iceServers || [];
+    log(iceServers.length
+        ? `已取得 ICE 配置（${iceServers.length} 组服务器）`
+        : "服务器未下发 ICE 服务器 —— 局域网模式，只用 host candidate");
+  } catch (e) {
+    // 局域网模式 --ice-mode none 时 /ice.json 仍然存在，只是 iceServers 为空，
+    // 所以走到这里通常意味着页面不是从信令服务器加载的。
+    log("取 /ice.json 失败（" + e.message + "），按无 STUN/TURN 处理");
+  }
+}
+
+/* -------------------------------------------------------- PeerConnection */
+function createPc() {
+  pc = new RTCPeerConnection({ iceServers, bundlePolicy:"max-bundle" });
+
+  pc.ontrack = (ev) => {
+    log(`ontrack: kind=${ev.track.kind}`);
+    if (ev.streams && ev.streams[0]) {
+      video.srcObject = ev.streams[0];
+    } else {
+      // webrtcbin 的 msid 形如 userXXX@host-yyy，浏览器有时不把它塞进
+      // ev.streams，这时必须手动挂 track，否则 srcObject 一直是 null —— 黑屏。
+      if (!video.srcObject) video.srcObject = new MediaStream();
+      video.srcObject.addTrack(ev.track);
+    }
+    video.play().catch((e) => log("video.play() 被拒绝: " + e.message));
+    startStats();
+  };
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) {
+      send({ type:"candidate", candidate:ev.candidate.candidate,
+             sdpMLineIndex:ev.candidate.sdpMLineIndex });
+    }
+  };
+
+  // 打洞失败时这里给出错误码和地址，是排查防火墙最直接的线索。
+  pc.onicecandidateerror = (ev) => {
+    log(`ICE 候选错误: code=${ev.errorCode} "${ev.errorText}" ` +
+        `url=${ev.url || "?"} ${ev.address || "?"}:${ev.port || "?"}`);
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    if (!pc) return;
+    log("iceConnectionState = " + pc.iceConnectionState);
+    // 注意：这个值报 connected **不代表有媒体**。板子实测遇到过
+    // iceConnectionState=connected 而画面全黑的情况。真正算数的是
+    // 候选对的字节有没有在涨 —— 见下面的 getStats。
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (!pc) return;
+    log("connectionState = " + pc.connectionState);
+    if (pc.connectionState === "connected") {
+      setStatus("已连接", "ok");
+      dumpIce().catch(() => {});
+    } else if (pc.connectionState === "failed") {
+      setStatus("连接失败", "err");
+    }
+  };
+}
+
+function teardownPc() {
+  stopStats();
+  if (pc) { pc.close(); pc = null; }
+  pendingCandidates.length = 0;
+  prevSample = null;
+  lastStats = null;
+  statsEl.textContent = "等待发布端…";
+}
+
+/* 把板子 offer 里的 m-line 和方向打出来。
+
+   方向这几个值在浏览器里**都不报错**，只有这一行 SDP 说得清：
+     sendonly  板子只发（视频这一路就该是这个）
+     recvonly  板子只收
+     sendrecv  双向 */
+function logOfferMedia(sdp) {
+  const lines = (sdp || "").split(/\r?\n/).map((l) => l.trim());
+  const mIdx = [];
+  lines.forEach((l, i) => { if (l.startsWith("m=")) mIdx.push(i); });
+  if (!mIdx.length) { log("!! offer 里没有 m= 行，SDP 可能没解析出来"); return; }
+
+  mIdx.forEach((start, k) => {
+    const end = (k + 1 < mIdx.length) ? mIdx[k + 1] : lines.length;
+    let dir = "（未写，默认 sendrecv）";
+    for (let j = start + 1; j < end; j++) {
+      const v = lines[j].match(/^a=(sendrecv|sendonly|recvonly|inactive)$/);
+      if (v) { dir = v[1]; break; }
+    }
+    log(`  offer m-line[${k}] ${lines[start]}  方向=${dir}`);
+  });
+
+}
+
+/* ------------------------------------------------------------ 连接流程 */
+async function connect() {
+  if (pc) return;
+  await resolveRoom();
+  await loadIceServers();
+  createPc();
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}/ws/view?room=${encodeURIComponent(room)}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => { log("信令已连接"); setStatus("等待发布端…", "warn"); };
+
+  ws.onerror = () => log("信令 WebSocket 出错");
+
+  ws.onclose = () => { log("信令已断开"); teardownPc(); setStatus("已断开", "err"); };
+
+  ws.onmessage = async (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); }
+    catch { log("非 JSON 消息: " + String(ev.data).slice(0,120)); return; }
+
+    try {
+      switch (msg.type) {
+        case "offer": {
+          // 发布端重连后会发来全新的 offer，而一个 pc 不能重复协商，必须重建。
+          if (!pc) { log("收到新 offer，重建 PeerConnection…"); createPc(); }
+          log("收到 offer，创建 answer…");
+          logOfferMedia(msg.sdp);
+          await pc.setRemoteDescription({ type:"offer", sdp:msg.sdp });
+          await drainPendingCandidates();
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          send({ type:"answer", sdp:pc.localDescription.sdp });
+          log("answer 已发送");
+          break;
+        }
+        case "candidate": {
+          if (!msg.candidate) break;
+          const init = { candidate:msg.candidate, sdpMLineIndex:msg.sdpMLineIndex };
+          // 候选常常比 offer 先到（发布端是 trickle 发的），pc 或远端描述还没
+          // 就绪时先缓存，等 setRemoteDescription 之后再补进去。
+          if (!pc || !pc.remoteDescription) { pendingCandidates.push(init); break; }
+          await pc.addIceCandidate(init)
+            .catch((e) => log("addIceCandidate 失败: " + e.message));
+          break;
+        }
+        case "waiting":
+          log("服务器: " + (msg.message || "发布端还没连上"));
+          setStatus("等待发布端…", "warn");
+          break;
+        case "publisher-gone":
+          // 发布端掉线。信令连接保持不动 —— 它重连后服务器会重新配对，
+          // 届时会再来一个全新 offer，所以这里只拆 pc、不关 ws。
+          log("发布端已断开，等它重连…");
+          setStatus("发布端已断开", "err");
+          teardownPc();
+          break;
+        case "error":
+          log("服务器错误: " + msg.message);
+          setStatus("服务器错误", "err");
+          break;
+        default:
+          log("未知消息: " + msg.type);
+      }
+    } catch (err) {
+      log("处理 " + msg.type + " 失败: " + err.message);
+    }
+  };
+}
+
+async function drainPendingCandidates() {
+  while (pendingCandidates.length) {
+    const c = pendingCandidates.shift();
+    await pc.addIceCandidate(c).catch((e) => log("缓存候选入队失败: " + e.message));
+  }
+}
+
+/* ---------------------------------------------------------------- 统计 */
+function startStats() {
+  if (statsTimer) return;
+  statsTimer = setInterval(collectStats, 1000);
+  // 诊断上报频率比界面刷新低：样本要留在服务器上供 analyze_diag.py 分析，
+  // 2 秒一条足够刻画稳态，也不会把服务器内存刷爆。
+  // 诊断上报必须和 collectStats 同频（1s），不能更慢。
+  // "最长冻结"那条判据的分辨率就是这里：按 2 秒上报时，一次 1.5 秒的卡顿
+  // 可能恰好被两个采样点跨过去，完全看不见；量出来的也只能是 2 秒的整数倍。
+  // 服务器侧 _diag 是 maxlen=2000 的 deque，两端各 1Hz 还有约 16 分钟历史，
+  // 对一次验证来说绰绰有余。
+  diagTimer = setInterval(postDiag, 1000);
+}
+
+function stopStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+}
+
+/* 候选端点摘要。判据里最想知道的一件事是"媒体到底直连还是走 TURN 中继"：
+   走中继就意味着绕公网一圈，突发丢包和随之而来的解码冻结都从这里来，
+   而 getStats 的字节数无论走哪条路都长得一样，看不出来。 */
+function candBrief(c) {
+  if (!c) return null;
+  return {
+    type: c.candidateType,          // host / srflx / prflx / relay
+    protocol: c.protocol,           // udp / tcp
+    address: c.address || c.ip,
+    port: c.port,
+    relayProtocol: c.relayProtocol, // 只在中继候选上有
+  };
+}
+
+async function collectStats() {
+  if (!pc || pc.connectionState !== "connected") return;
+  const report = await pc.getStats();
+
+  let inbound = null, transport = null;
+  const pairs = [];
+  report.forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
+    if (r.type === "transport" && transport === null) transport = r;
+    if (r.type === "candidate-pair") pairs.push(r);
+  });
+
+  /* 候选对：主路走 transport.selectedCandidatePairId —— 这是"当前真正在用
+     的那一对"。不能只遍历 candidate-pair 挑 nominated 的那个：ICE 重启后
+     旧候选对的 nominated 标志还挂着，而它的字节是**冻住的**，拿它算速率会
+     得出一路 0，看起来像"媒体断了"，其实连接好好的。
+
+     但实测（349 条样本，0 条拿到）transport 这条路在某些浏览器/版本上取不到
+     东西，于是退回到"nominated 且 succeeded 且已收字节最多"的那一对。
+     退路**可能挑中冻住的旧对**，所以把走了哪条路一并上报：
+     判据那边仍然要求字节确实在增长，挑错了照样过不了，不会被悄悄放过。 */
+  let pair = null, pairSource = null;
+  if (transport && transport.selectedCandidatePairId) {
+    pair = report.get(transport.selectedCandidatePairId) || null;
+    if (pair) pairSource = "transport";
+  }
+  if (!pair && pairs.length) {
+    const live = pairs.filter((p) => p.nominated && p.state === "succeeded");
+    const pool = live.length ? live : pairs;
+    pair = pool.reduce((a, b) =>
+      (b.bytesReceived || 0) > (a.bytesReceived || 0) ? b : a);
+    pairSource = `fallback(${live.length ? "nominated" : "all"}/${pairs.length}对)`;
+  }
+
+  if (!inbound) { statsEl.textContent = "尚未收到视频流…"; return; }
+
+  const now = inbound.timestamp;
+  let fps = "—", kbps = "—", pairRate = "—";
+  if (prevSample && now > prevSample.timestamp) {
+    const dt = (now - prevSample.timestamp) / 1000;
+    fps = ((inbound.framesDecoded - prevSample.framesDecoded) / dt).toFixed(1);
+    kbps = (((inbound.bytesReceived - prevSample.bytesReceived) * 8) / dt / 1000)
+             .toFixed(0);
+    if (pair && prevSample.pairBytes != null) {
+      pairRate = (((pair.bytesReceived - prevSample.pairBytes) / dt) / 1024)
+                   .toFixed(0) + " KiB/s";
+    }
+  }
+  prevSample = {
+    timestamp: now,
+    framesDecoded: inbound.framesDecoded,
+    bytesReceived: inbound.bytesReceived,
+    pairBytes: pair ? pair.bytesReceived : null,
+  };
+
+  statsEl.textContent =
+    `分辨率      ${inbound.frameWidth || "?"} x ${inbound.frameHeight || "?"}\n` +
+    `帧率        ${fps} fps  (累计 ${inbound.framesDecoded} 帧)\n` +
+    `码率        ${kbps} kbps\n` +
+    `已接收      ${(inbound.bytesReceived / 1048576).toFixed(2)} MiB\n` +
+    `丢包        ${inbound.packetsLost || 0}\n` +
+    `抖动        ${inbound.jitter != null ? (inbound.jitter*1000).toFixed(1)+" ms" : "—"}\n` +
+    `候选对速率  ${pairRate}\n` +
+    `播放位置    ${video.currentTime.toFixed(1)} s\n` +
+    `连接状态    ${pc.connectionState} / ICE ${pc.iceConnectionState}`;
+
+  // 板子发来的 offer 就在 remoteDescription 里 —— 它才是"板子愿意给什么"的
+  // 权威来源。看 nackCount=0 只能知道"浏览器没发过重传请求"，说明不了
+  // "是没协商上还是不需要"；那要翻这里的 a=rtcp-fb 和 a=rtx。
+  // 支持重传需要三样同时在：a=rtcp-fb:<pt> nack、a=rtx:<pt2>、a=fmtp:<pt2> apt=<pt>。
+  function negSummary() {
+    const sdp = pc.remoteDescription && pc.remoteDescription.sdp;
+    if (!sdp) return null;
+    const mlines = [], rtcpFb = [];
+    let rtxLines = 0, aptLines = 0, rtcpMux = false;
+    for (const raw of sdp.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line.startsWith("m=")) mlines.push(line);
+      else if (line.startsWith("a=rtcp-fb:")) rtcpFb.push(line);
+      else if (line.startsWith("a=rtx:")) rtxLines++;
+      else if (line.includes("apt=")) aptLines++;
+      else if (line.startsWith("a=rtcp-mux")) rtcpMux = true;
+    }
+    return { mlines, rtcpFb, rtxLines, aptLines, rtcpMux };
+  }
+
+  // 这份样本还要上报给服务器，多存一份免得 postDiag 里再算一遍。
+  lastStats = {
+    pageVersion: PAGE_VERSION,
+    browser: navigator.userAgent,
+    negotiation: negSummary(),
+    video: {
+      bytesReceived: inbound.bytesReceived,
+      packetsReceived: inbound.packetsReceived,
+      packetsLost: inbound.packetsLost || 0,
+      framesDecoded: inbound.framesDecoded,
+      frameWidth: inbound.frameWidth,
+      frameHeight: inbound.frameHeight,
+      fps: fps === "—" ? null : Number(fps),
+      kbps: kbps === "—" ? null : Number(kbps),
+      jitter: inbound.jitter,
+
+      // 下面这几个是**浏览器自己记的账**，比我按采样间隔反推可靠。
+      //
+      // freezeCount / totalFreezesDuration：Chrome 有，用于跨过采样间隔抓短卡顿。
+      // **Firefox 不实现这两个字段**（取回来是 undefined，不是字段名写错）。
+      // 所以冻结统计的主力仍是"相邻样本帧增量是否为 0"，分辨率被上报频率卡在
+      // 1 秒 —— 短于约 1 秒的卡顿这个方法看不见。Chrome 在的时候用 freezeCount
+      // 当权威值，Firefox 在的时候只能认那个 1 秒地板。
+      //
+      // keyFramesDecoded：累计解出的关键帧数。这是判断"按需关键帧到底有没有发生"
+      // 的**直接**证据 —— gop=60 在 20fps 下 IDR 应该每 3 秒来一个，如果实测间隔
+      // 明显短于 3 秒，那只可能是有人请求了。配合 pliCount 就能把链路两半分开：
+      // pliCount 涨了而 keyFramesDecoded 仍是 3 秒一格 => 板子收到 PLI 不响应。
+      //
+      // pliCount：板子 offer 里 a=rtcp-fb:102 nack pli 是有的，所以 PLI 协商通过。
+      // 实测 Firefox 全程 0，Chrome 会发 —— 同一套板子代码，差别在浏览器。
+      //
+      // nackCount 恒为 0，且**不是**因为丢包不够：板子 offer 里声明了 nack，
+      // 却没有 a=rtx / apt= 行，没有 RTX 载荷类型。按 RFC 4588 重传必须走
+      // 独立 PT，接收端拿不到 PT 就用不了 NACK，所以重传根本不可能发生。
+      // 这是 webrtcbin 1.20.3 的能力上限，不是配置错。Chrome 和 Firefox 都是 0。
+      //
+      // jitterBufferDelay / jitterBufferEmittedCount：两个一除就是帧在抖动缓冲里
+      // 平均等了多久。如果冻结的主因是等关键帧，这个值应该很小；如果它很大，
+      // 那冻结是缓冲策略造成的，是另一个（更好修的）故事。
+      framesReceived: inbound.framesReceived,
+      framesDropped: inbound.framesDropped,
+      freezeCount: inbound.freezeCount,
+      totalFreezesDuration: inbound.totalFreezesDuration,
+      pliCount: inbound.pliCount,
+      nackCount: inbound.nackCount,
+      firCount: inbound.firCount,
+      keyFramesDecoded: inbound.keyFramesDecoded,
+      framesPerSecond: inbound.framesPerSecond,
+      jitterBufferDelay: inbound.jitterBufferDelay,
+      jitterBufferEmittedCount: inbound.jitterBufferEmittedCount,
+    },
+    selectedPair: pair ? {
+      id: pair.id,
+      state: pair.state,
+      nominated: !!pair.nominated,
+      bytesSent: pair.bytesSent,
+      bytesReceived: pair.bytesReceived,
+      currentRoundTripTime: pair.currentRoundTripTime,
+      localCandidateId: pair.localCandidateId,
+      remoteCandidateId: pair.remoteCandidateId,
+    } : null,
+    pairSource: pairSource,
+    pairLocal: pair ? candBrief(report.get(pair.localCandidateId)) : null,
+    pairRemote: pair ? candBrief(report.get(pair.remoteCandidateId)) : null,
+    // 原始 transport 统计照原样带回去。主路取不到东西时，光看"结果是 null"
+    // 猜不出是浏览器没给这条统计、还是给了但没有 selectedCandidatePairId ——
+    // 这两种要改的地方完全不同。带上原始对象就不用再猜一轮。
+    transports: transport ? Object.assign({}, transport) : null,
+    candidatePairCount: pairs.length,
+    srcTime: video.currentTime,
+  };
+}
+
+/* ------------------------------------------------------------ 诊断上报
+
+   无头验证的唯一通道：浏览器里的人眼看不到东西，console.log 在强杀进程时
+   也拿不到，只能让页面自己把 getStats() 摘要送回服务器，事后慢慢分析。 */
+async function postDiag() {
+  if (!lastStats || !pc) return;
+  try {
+    await fetch("./diag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        role: "browser",
+        room,
+        ts: Date.now() / 1000,
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        ...lastStats,
+      }),
+    });
+  } catch (e) { /* 上报失败不影响观看，静默 */ }
+}
+
+/* ------------------------------------------------------------ ICE 详情 */
+async function dumpIce() {
+  if (!pc) return;
+  const report = await pc.getStats();
+  const byId = {};
+  const locals = [], remotes = [], pairs = [];
+  report.forEach((r) => {
+    byId[r.id] = r;
+    if (r.type === "local-candidate") locals.push(r);
+    else if (r.type === "remote-candidate") remotes.push(r);
+    else if (r.type === "candidate-pair") pairs.push(r);
+  });
+
+  const cand = (c) => {
+    const addr = c.address || c.ip || "?";
+    let s = `${(c.candidateType||"?").padEnd(6)} ${(c.protocol||"?").toUpperCase().padEnd(4)} ` +
+            `${addr}:${c.port}`;
+    // 浏览器会把 host candidate 混淆成随机的 .local 名（Chrome、Firefox 都
+    // 这么做）。板子那侧要靠 avahi + libnss-mdns 才解析得了，缺一个就是
+    // "连上了但零媒体"。
+    if (/\.local$/i.test(addr)) s += "   <- mDNS 混淆地址";
+    return s;
+  };
+  const list = (arr) => arr.length ? arr.map((c) => "  " + cand(c)).join("\n") : "  （无）";
+
+  const srv = iceServers.length
+    ? iceServers.map((s) => (s.urls||[]).join(" / ")).join(" ; ")
+    : "无（局域网，只用 host candidate）";
+
+  let out = `ICE 服务器  ${srv}\n\n`;
+  out += `本地候选 (local) — ${locals.length} 个\n${list(locals)}\n\n`;
+  out += `远端候选 (remote) — ${remotes.length} 个\n${list(remotes)}\n\n`;
+  out += `候选对 (candidate pairs) — ${pairs.length} 对\n`;
+  if (!pairs.length) out += "  （无）\n";
+  pairs.forEach((p) => {
+    const l = byId[p.localCandidateId] || {}, r = byId[p.remoteCandidateId] || {};
+    out += `${p.nominated ? "  ★" : "   "} state=${p.state} nominated=${!!p.nominated}`;
+    if (p.currentRoundTripTime != null) {
+      out += `  rtt=${(p.currentRoundTripTime*1000).toFixed(1)}ms`;
+    }
+    out += `\n      本端 ${l.address||l.ip||"?"}:${l.port} (${l.candidateType||"?"})` +
+           `  <->  远端 ${r.address||r.ip||"?"}:${r.port} (${r.candidateType||"?"})\n`;
+    out += `      已发 ${p.bytesSent||0} B / 已收 ${p.bytesReceived||0} B\n`;
+  });
+  out += `\n要逐条的 ICE 事件流和完整 SDP，开 chrome://webrtc-internals。`;
+  iceEl.textContent = out;
+}
+
+/* 拆掉当前会话再连一次。
+   ws.onclose 本来也会 teardownPc，但这里显式做一遍，不依赖回调时序；
+   而关旧的 ws 之前先摘掉 onclose，否则它会再触发一次 setStatus("已断开")，
+   界面上闪一下"已断开"再回到"重连中"，看起来像出错了。 */
+function reconnect() {
+  const old = ws;
+  ws = null;
+  if (old) {
+    old.onclose = null;
+    try { old.close(); } catch (e) { /* 已经关了就算了 */ }
+  }
+  teardownPc();
+  setStatus("重连中…", "warn");
+  connect();
+}
+
+/* ---------------------------------------------------------------- 启动 */
+window.addEventListener("beforeunload", () => send({ type:"bye" }));
+
+log(`页面来自 ${location.host}，自动连接…`);
+connect();
+</script>
+</body>
+</html>
