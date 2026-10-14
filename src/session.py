@@ -37,6 +37,7 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 import pipeline
+import sources
 
 log = logging.getLogger("session")
 
@@ -53,15 +54,19 @@ class DeviceSession:
     发送那一步是唯一的差异点。
     """
 
-    def __init__(self, send_fn, loop, args, ice=None):
+    def __init__(self, send_fn, loop, args, ice=None, source=None):
         self.send_fn = send_fn
         self.loop = loop                 # asyncio 事件循环，用于跨线程投递
         self.args = args
         self.ice = ice or {}
+        # 初始采集源。不给就用板子的第一路；真正的"当前源"由 switch 持有。
+        self.source = source or sources.SOURCES[0]
 
         self.pipeline = None
         self.webrtcbin = None
-        self.wb = None                   # 白平衡桥（--camera-wb 没开时是 None）
+        self.switch = None               # 骨架 + 当前那一段采集（见 pipeline.py）
+        self._bus = None                 # 拆的时候要把它身上的 watch 摘掉，见 stop()
+        self._bus_hid = 0
         self.audio_elements = None       # 回程链（浏览器→扬声器），建好前是 None
         self.stopped = False
 
@@ -83,8 +88,9 @@ class DeviceSession:
 
     # ---------------- 生命周期 ----------------
     def start(self):
-        self.pipeline, self.webrtcbin, self.wb = pipeline.build(
-            self.args, self.ice, log, on_audio_elements=self._on_audio_elements)
+        self.pipeline, self.webrtcbin, self.switch = pipeline.build(
+            self.args, self.ice, log, self.source,
+            on_audio_elements=self._on_audio_elements)
 
         # 顺序有讲究：先接 on-ice-candidate / on-negotiation-needed，
         # 再 set_state(PLAYING)。反过来的话首次协商会因为没人接
@@ -103,15 +109,16 @@ class DeviceSession:
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+        # 句柄和 bus 都留着，拆会话时要把这条 watch 摘干净（见 stop()）。
+        self._bus = bus
+        self._bus_hid = bus.connect("message", self._on_bus_message)
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
         # 白平衡桥的线程要等 pipeline 真的跑起来再起：它一上来就 try_pull_sample，
         # 而 pipeline 还在 READY 的话 appsink 的 is_eos() 是 True（实测），
         # 线程会立刻判定"流结束了"自己收工，白平衡就静默失效了。
-        if self.wb is not None:
-            self.wb.start()
+        self.switch.start_bridges()
 
         log.info("pipeline 已启动，等待协商…")
 
@@ -122,14 +129,53 @@ class DeviceSession:
         if self.pipeline is not None:
             # 先 NULL 再收桥线程：NULL 会把 appsrc flush 掉，卡在满队列上的
             # push_buffer 立刻返回，线程不用等超时。
-            self.pipeline.set_state(Gst.State.NULL)
-            if self.wb is not None:
-                self.wb.stop()
-                self.wb = None
-            self.pipeline = None
+            if self.switch is not None:
+                self.switch.dispose()      # 里面已经等过 NULL 了
+                self.switch = None
+            else:
+                # 没有 switch 时这条也要等 —— 理由见 VideoSwitch.dispose()：
+                # set_state(NULL) 是异步的，不等就走，元素会在半路上被析构。
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline.get_state(2 * Gst.SECOND)
+        self.pipeline = None
         self.webrtcbin = None
+
+        # 把 bus 的 watch 摘掉。**这条不是设备 fd 泄漏的解**（试过，摘了照样漏，
+        # 真正的解在 VideoSwitch.dispose() 里 —— 把采集段从管道里摘掉），但它是
+        # 该做的收尾：`add_signal_watch()` 在默认主上下文上挂的 GSource 会一直
+        # 活着，而且消息还会往一个已经拆掉的会话上派发。
+        # 先 disconnect 再 remove_signal_watch：反过来的话，摘 watch 的过程中
+        # 还可能有一条消息派发到回调上，而那时会话已经在拆了。
+        if self._bus is not None:
+            if self._bus_hid:
+                self._bus.disconnect(self._bus_hid)
+                self._bus_hid = 0
+            self._bus.remove_signal_watch()
+            self._bus = None
+
         log.info("会话已关闭（共发出 %d 包 / %.2f MiB）",
                  self.n_packets_out, self.n_bytes_out / 1048576)
+
+    # ---------------- 切换摄像头 ----------------
+    def current_source(self):
+        """当前这一路（给报错信息和遥测用）。"""
+        if self.switch is not None and self.switch.source is not None:
+            return self.switch.source
+        return self.source
+
+    def switch_source(self, name):
+        """换一路摄像头。**只能在 GLib 线程调用**（见 pipeline.VideoSwitch）。
+
+        不重新协商、不重建 PeerConnection、不碰音频 —— 换的只有采集那一段，
+        编码输出仍是同一份 caps。返回最终生效的源名。
+        """
+        if self.switch is None:
+            # 还没有会话（没有观看端）时只记住选择，等建 pipeline 时用它。
+            self.source = sources.resolve(name)
+            return self.source.name
+        applied = self.switch.switch(name)
+        self.source = self.switch.source
+        return applied
 
     # ---------------- 统计探针 ----------------
     def _attach_counters(self):
@@ -232,10 +278,16 @@ class DeviceSession:
         return Gst.PadProbeReturn.OK
 
     def counters(self):
-        """给遥测用的快照。"""
+        """给遥测用的快照。
+
+        video_source / video_switches 是"板子真的换了那一段"的设备侧判据 ——
+        浏览器那边的画面变化可以被很多原因解释，这两个数是直接证据。
+        """
         return {
             "video_packets_out": self.n_packets_out,
             "video_bytes_out": self.n_bytes_out,
+            "video_source": self.current_source().name,
+            "video_switches": self.switch.n_switches if self.switch is not None else 0,
             "audio_packets_out": self.n_audio_packets_out,
             "audio_bytes_out": self.n_audio_bytes_out,
             "audio_frames_decoded": self.n_audio_frames_decoded,
@@ -251,14 +303,20 @@ class DeviceSession:
                 log.error("  调试信息: %s", debug)
 
             src = message.src.get_name() if message.src else "?"
-            if src == "v4l2src0":
+            # 按**工厂名**判，不按元素名：v4l2src 现在在采集段那个 bin 里，
+            # 名字可能是 v4l2src0/1/…（每次换源就多一个编号），拿名字比会漏。
+            factory = ""
+            if message.src is not None and message.src.get_factory() is not None:
+                factory = message.src.get_factory().get_name()
+            if factory == "v4l2src" or src.startswith("v4l2src"):
                 self._explain_camera_failure()
             elif "not-negotiated" in (err.message or ""):
+                s = self.current_source()
                 log.error(
                     "  协商失败通常是 caps 和设备实际能力对不上。"
                     "确认 %s 支持 %dx%d@%d 的 %s（用 v4l2-ctl --list-formats-ext -d %s 看）",
-                    self.args.camera, self.args.width, self.args.height,
-                    self.args.fps, pipeline.VIDEO_FORMAT, self.args.camera,
+                    s.device, self.args.width, self.args.height,
+                    self.args.fps, s.fourcc, s.device,
                 )
         elif t == Gst.MessageType.EOS:
             log.info("管线走到 EOS（摄像头是 live 源，正常不该出现）")
@@ -268,13 +326,17 @@ class DeviceSession:
 
         没有这段的话，用户只能看到一句 "Failed to allocate required memory"，
         而那句话和真正的原因（格式不支持 / 多平面节点被 libv4l2 拦截）差得很远。
+
+        列的必须是**当前这一路**的设备 —— 切换之后 args.camera 会被同步成新的
+        节点（见 sources.apply_quality），拿它去问才有意义。
         """
         import subprocess
 
-        log.error("  摄像头 %s 打不开。它实际支持的格式：", self.args.camera)
+        device = self.current_source().device
+        log.error("  摄像头 %s 打不开。它实际支持的格式：", device)
         try:
             out = subprocess.run(
-                ["v4l2-ctl", "--list-formats-ext", "-d", self.args.camera],
+                ["v4l2-ctl", "--list-formats-ext", "-d", device],
                 capture_output=True, text=True, timeout=5,
             )
         except (OSError, subprocess.SubprocessError):

@@ -15,3 +15,7 @@ __pycache__/
 *.log
 *.raw
 *.wav
+
+# device_agent 的本地控制端点（unix socket，页面切换摄像头用）。
+# 相对路径按项目根算，见 device_agent.socket_path()。
+run/

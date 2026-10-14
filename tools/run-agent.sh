@@ -2,7 +2,11 @@
 # 板子侧发布端。信令服务器在 VPS 上，经 nginx 443 反代（wss）。
 #
 #     tools/run-agent.sh            正常启动
-#     tools/run-agent.sh --gop 10   追加/覆盖参数（后面的同名参数生效）
+#     tools/run-agent.sh --gop 30   追加/覆盖参数（后面的同名参数生效）
+#
+# **--gop 不用在这儿写**：device_agent.py 的默认值就是 10，而整条验收线都压在
+# 那个值上（中途加入的浏览器、切换摄像头都要等下一个 IDR；60 会让
+# analyze_diag.py 的"画面静止时间占比"超上限）。要改就显式传，别改默认值。
 #
 # **用 bash -l 起**（`nohup bash -l tools/run-agent.sh`）：板子 BSP 的
 # GStreamer/MPP 环境变量只在登录 shell 里导出。其中 GST_V4L2_USE_LIBV4L2=1

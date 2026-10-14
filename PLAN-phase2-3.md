@@ -21,7 +21,7 @@
 | `web/monitor.html` | 只有画面 + getStats + diag 上报；`<video muted autoplay>` | 加麦克风、加命令台、去掉 muted |
 | `tools/analyze_diag.py` | 12 条判据 | 加音频判据、加遥操作判据 |
 | `certs/` | **空目录** | 放自签证书 |
-| `docs/` | **空目录**（原始需求第 3 条未交付） | 阶段三结束后补架构文档 |
+| `docs/` | `architecture.md` 已补（原始需求第 3 条） | 阶段三结束后追加遥操作那一节 |
 
 **信令通路不用改。** 浏览器 → `/ws/view` → 板子 → VPS，已经是双向透传，
 二、三阶段新增的都是媒体面和 DataChannel 面的事。
@@ -320,4 +320,4 @@ CMD #7 FORWARD 12:00:01.2
 - [ ] `web/monitor.html` 对讲 + 命令台（记得动 `PAGE_VERSION`）
 - [ ] `tools/analyze_diag.py` 新增判据
 - [ ] `tools/selftest.py`（可选）
-- [ ] **`docs/architecture.md`** —— 原始需求第 3 条，两阶段做完一起补
+- [x] **`docs/architecture.md`** —— 原始需求第 3 条，已交付（阶段三那一节等做完再补）

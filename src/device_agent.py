@@ -32,11 +32,13 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import aiohttp
+from aiohttp import web
 from gi.repository import GLib
 
 import audio             # 音频设备探测：判错设备不会报错，只会推一路本底噪声
 import camera            # 画质兜底：板子没有 3A，亮度只能自己闭环
 import pipeline          # 必须早于 Gst.init()：它会在导入时清掉 BSP 埋的环境变量
+import sources           # 板子上有哪些摄像头、各自要什么
 import whitebalance      # 画质兜底：同一根因的另一半 —— ISP 没跑 AWB，画面偏绿
 from session import DeviceSession
 
@@ -102,6 +104,176 @@ def quiet_ws_reset(loop):
 
 
 # --------------------------------------------------------------------------- #
+# 发布端的可变状态
+# --------------------------------------------------------------------------- #
+class AgentState:
+    """跨重连存活的那点状态。
+
+    session 是**当前那一路观看端**（本项目同时只接受一个，见 session.py），
+    没有观看端时是 None。source 是"记住的选择"—— 没有观看端时切换摄像头
+    只改它，下一个观看端接入时按它建 pipeline。
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.session = None
+        self.source = sources.initial(args.camera_source)
+        self.lock = asyncio.Lock()      # 串行化切换，防页面连点
+
+    def current_name(self):
+        if self.session is not None:
+            return self.session.current_source().name
+        return self.source.name
+
+
+# --------------------------------------------------------------------------- #
+# 本地控制端点：页面切换摄像头
+# --------------------------------------------------------------------------- #
+# 为什么不用信令通道把"换个摄像头"从页面发到板子：信令服务器两个方向都是
+# **白名单分派**，未知的 type 只在 else 里 log.debug 一句就丢掉（见
+# signal_server.py 的 handle_view / handle_publish），要加一条就得改 VPS 上
+# 跑着的生产服务。而且这件事**本来就该在本地做** —— 切换摄像头是局域网内的事，
+# 绕公网 VPS 一圈意味着 VPS 挂了就换不了摄像头，可板子就在隔壁。
+#
+# 走 unix socket 而不是 127.0.0.1:端口：只多两行（清残留 + chmod），
+# 但保住了"本进程一个入站 TCP 端口都不开"这条性质 —— 对一个强调
+# "NAT 后面、4G 网里都能用"的项目不值得为省两行代码去破它。
+def _settle(fut, outcome):
+    """从别的线程把结果填回 asyncio 的 future。"""
+    if fut.done():
+        return
+    if isinstance(outcome, BaseException):
+        fut.set_exception(outcome)
+    else:
+        fut.set_result(outcome)
+
+
+async def run_on_glib(fn, *fn_args, timeout=15.0):
+    """把一次调用投到 GLib 线程执行并等结果。
+
+    项目里已有的跨线程投递是**反方向**的（GLib → asyncio，见
+    session._send_threadsafe）。这里是 asyncio → GLib：`GLib.idle_add` 本身
+    线程安全，从事件循环这边丢过去没问题；结果再用 call_soon_threadsafe 回填。
+
+    为什么必须投过去：在 PLAYING 的管线里加删元素会碰 GStreamer 的状态机和
+    streaming 线程，从 asyncio 线程直接调是未定义行为。
+    """
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def on_idle():
+        try:
+            outcome = fn(*fn_args)
+        except Exception as exc:            # noqa: BLE001
+            outcome = exc
+        loop.call_soon_threadsafe(_settle, fut, outcome)
+        return False                        # 只跑一次
+
+    GLib.idle_add(on_idle)
+    return await asyncio.wait_for(fut, timeout)
+
+
+def socket_path(args):
+    p = Path(args.agent_socket)
+    return p if p.is_absolute() else (HERE.parent / p)
+
+
+async def handle_camera(request):
+    """GET  = 有哪些摄像头 + 当前是哪个
+    POST = 切到某个（{"name": "usb"}）
+    """
+    state = request.app["state"]
+
+    if request.method == "GET":
+        return web.json_response({
+            "available": sources.available(),
+            "current": state.current_name(),
+        })
+
+    try:
+        body = await request.json()
+    except Exception:                       # noqa: BLE001
+        return web.json_response(
+            {"ok": False, "error": "请求体不是 JSON"}, status=400)
+
+    name = (body or {}).get("name") if isinstance(body, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        # 少了 name 直接说清楚。放它往下走的话 resolve(None) 会报
+        # "未知摄像头 None"，把"你忘了给字段"说成"你给的名字不对"。
+        return web.json_response(
+            {"ok": False, "error": '请求体里要有 name 字段，如 {"name": "usb"}'},
+            status=400)
+
+    try:
+        src = sources.resolve(name)
+    except KeyError as exc:
+        return web.json_response(
+            {"ok": False, "error": sources.message_of(exc),
+             "available": sources.available()},
+            status=400)
+
+    if not os.path.exists(src.device):
+        return web.json_response(
+            {"ok": False, "error": "设备 %s 不存在（摄像头没插好？）" % src.device},
+            status=409)
+
+    async with state.lock:
+        if state.current_name() == src.name and state.session is not None:
+            return web.json_response(
+                {"ok": True, "current": src.name, "applied": False,
+                 "note": "已经在这一路上"})
+
+        # 画质兜底在**换段之前**跑，而且放线程池：亮度闭环要 sleep 好几轮，
+        # 别堵事件循环。（此刻旧段还在跑，而它要用的 ISP 节点是空的。）
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, sources.apply_quality, src, state.args)
+        except Exception as exc:            # noqa: BLE001
+            log.exception("画质兜底失败")
+            return web.json_response(
+                {"ok": False, "error": "画质兜底失败: %s" % exc}, status=500)
+
+        session = state.session
+        if session is None or session.stopped:
+            # 没有观看端：只记住选择，下一个观看端接入时按它建 pipeline。
+            state.source = src
+            return web.json_response(
+                {"ok": True, "current": src.name, "applied": False})
+
+        try:
+            applied = await run_on_glib(session.switch_source, src.name)
+        except Exception as exc:            # noqa: BLE001
+            log.exception("切换摄像头失败")
+            return web.json_response(
+                {"ok": False, "error": str(exc)}, status=500)
+
+        state.source = session.current_source()
+        return web.json_response({"ok": True, "current": applied, "applied": True})
+
+
+async def start_control(state):
+    """起本地控制端点。返回 AppRunner，由调用方在退出时 cleanup。"""
+    app = web.Application()
+    app["state"] = state
+    app.router.add_route("*", "/camera", handle_camera)
+
+    path = socket_path(state.args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 上一次没退干净留下的 socket 文件会让 bind 直接失败（EADDRINUSE），
+    # 而报错完全看不出是"残留文件"。
+    if path.exists():
+        path.unlink()
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.UnixSite(runner, str(path)).start()
+    # 只有本机、而且只有跑 web_server 的那个用户可以调它。
+    os.chmod(path, 0o600)
+    log.info("控制端点 %s（GET/POST /camera）", path)
+    return runner
+
+
+# --------------------------------------------------------------------------- #
 # 遥测：把板子侧的计数送回服务器，供 tools/analyze_diag.py 算字节守恒
 # --------------------------------------------------------------------------- #
 async def telemetry_loop(http, args, get_session, base_url, interval=1.0):
@@ -136,7 +308,7 @@ async def telemetry_loop(http, args, get_session, base_url, interval=1.0):
 # --------------------------------------------------------------------------- #
 # 一轮连接
 # --------------------------------------------------------------------------- #
-async def publish_once(args, url, ice_url):
+async def publish_once(args, state, url, ice_url):
     """连上信令服务器，按需建会话并推流。
 
     返回 True 表示**正常断开**（网络抖动、对方关连接），调用方可以重置退避。
@@ -146,7 +318,6 @@ async def publish_once(args, url, ice_url):
     quiet_ws_reset(asyncio.get_running_loop())
     clean = True
     loop = asyncio.get_running_loop()
-    session = None
     ctx = make_ssl_context(args)
 
     # 把 ctx 挂在 connector 上，而不是只传给 ws_connect：遥测走的是同一个
@@ -161,7 +332,7 @@ async def publish_once(args, url, ice_url):
             log.info("已连上信令服务器: %s", url)
             sender = WsSender(ws)
             telem = asyncio.create_task(
-                telemetry_loop(http, args, lambda: session, http_base_of(url))
+                telemetry_loop(http, args, lambda: state.session, http_base_of(url))
             )
             # lambda 是为了让遥测每轮都读到**当前**的 session 对象，
             # 而不是把建会话之前的 None 捕获死。
@@ -178,7 +349,7 @@ async def publish_once(args, url, ice_url):
                     if kind == "viewer-joined":
                         # 单观看端设计：已经有人在看就明确拒绝，
                         # 而不是默默开第二路抢同一个摄像头。
-                        if session is not None:
+                        if state.session is not None:
                             log.warning("已有一个观看端，拒绝新的连接")
                             await sender.send({
                                 "type": "error",
@@ -197,32 +368,35 @@ async def publish_once(args, url, ice_url):
                             log.error("服务器发的 viewer-joined 里没有 viewer 字段，"
                                       "无法路由，跳过这次接入")
                             continue
-                        session = DeviceSession(
-                            tag_viewer(sender, vid), loop, args, ice
+                        # source 用 state 里记住的那个：没有观看端时切过摄像头
+                        # 的话，新会话要按那个选择建 pipeline。
+                        state.session = DeviceSession(
+                            tag_viewer(sender, vid), loop, args, ice,
+                            source=state.source,
                         )
                         try:
-                            session.start()
+                            state.session.start()
                         except Exception as exc:  # noqa: BLE001
                             log.exception("建 pipeline 失败")
                             await sender.send({"type": "error", "message": str(exc)})
-                            session = None
+                            state.session = None
                             continue
                         log.info("观看端已接入，开始推流")
 
                     elif kind == "viewer-left":
-                        if session is not None:
-                            session.stop()
-                            session = None
+                        if state.session is not None:
+                            state.session.stop()
+                            state.session = None
                             log.info("观看端已离开")
 
                     elif kind in ("answer", "candidate"):
-                        if session is not None:
-                            session.on_signal(data)
+                        if state.session is not None:
+                            state.session.on_signal(data)
 
                     elif kind == "bye":
-                        if session is not None:
-                            session.stop()
-                            session = None
+                        if state.session is not None:
+                            state.session.stop()
+                            state.session = None
 
                     elif kind == "error":
                         code = data.get("code")
@@ -244,9 +418,9 @@ async def publish_once(args, url, ice_url):
                     await telem
                 except asyncio.CancelledError:
                     pass
-                if session is not None:
-                    session.stop()
-                    session = None
+                if state.session is not None:
+                    state.session.stop()
+                    state.session = None
     return clean
 
 
@@ -310,7 +484,7 @@ async def fetch_ice(http, ice_url):
         return {}
 
 
-async def run_publisher(args):
+async def run_publisher(args, state):
     """主循环：断线自动重连（指数退避）。板子和家宽掉线很常见。"""
     sep = "&" if "?" in args.signal else "?"
     url = "%s%sroom=%s&token=%s" % (
@@ -318,10 +492,13 @@ async def run_publisher(args):
     )
     ice_url = args.ice_url or (http_base_of(args.signal) + "/ice.json")
 
+    src = state.source
     log.info("房间 %s，ICE 策略 %s", args.room, args.ice_policy)
-    log.info("摄像头 %s  %dx%d@%d  %s  %d kbps",
-             args.camera, args.width, args.height, args.fps,
-             pipeline.VIDEO_FORMAT, args.bitrate // 1000)
+    log.info("视频源 %s（%s）  %dx%d@%d  %s  %d kbps",
+             src.name, src.device, args.width, args.height, args.fps,
+             src.fourcc, args.bitrate // 1000)
+    log.info("  可切换的源：%s（页面上有按钮，走板子本地的控制通道）",
+             "、".join("%s=%s" % (s.name, s.device) for s in sources.SOURCES))
     if args.no_audio:
         log.info("音频已关闭（--no-audio）：只推视频，和阶段一一样")
     else:
@@ -339,7 +516,7 @@ async def run_publisher(args):
     while True:
         clean = False
         try:
-            clean = await publish_once(args, url, ice_url)
+            clean = await publish_once(args, state, url, ice_url)
             log.info("信令连接已断开")
         except FatalSignalError as exc:
             log.error("服务器拒绝且重试解决不了: %s", exc)
@@ -355,6 +532,19 @@ async def run_publisher(args):
         log.info("%.0f 秒后重连…", delay)
         await asyncio.sleep(delay)
         delay = min(delay * 2, 30.0)
+
+
+async def run_forever(args, state):
+    """控制端点和推流循环一起跑。
+
+    **端点必须活在推流循环之外**：run_publisher 自己带重连退避，一次断线不该
+    让 socket 跟着消失 —— 断线恰恰是最想去点一下页面看看的时候。
+    """
+    runner = await start_control(state)
+    try:
+        return await run_publisher(args, state)
+    finally:
+        await runner.cleanup()
 
 
 # --------------------------------------------------------------------------- #
@@ -379,18 +569,32 @@ def parse_args(argv=None):
     g.add_argument("--ice-policy", default="all", choices=["all", "relay"],
                    help="relay = 强制走 TURN。用来验证中继真的生效")
 
-    c = p.add_argument_group("摄像头")
-    c.add_argument("--camera", default="/dev/video11",
-                   help="V4L2 设备节点。MIPI ISP 是 /dev/video11，"
-                        "/dev/video0 是裸 Bayer 节点，别用")
+    c = p.add_argument_group(
+        "摄像头（两个源都能用，观看页上可以随时切，见 src/sources.py）。"
+        "宽高帧率对**所有**源一视同仁：切换不用重新协商，靠的就是两路编码输出"
+        "的 caps 完全一样，所以别想着给某一个源单独设尺寸")
+    c.add_argument("--camera-source", default=sources.SOURCES[0].name,
+                   choices=sources.names(),
+                   help="启动时用哪一路。运行期可以用页面上的按钮换掉它")
+    c.add_argument("--agent-socket", default="run/agent.sock",
+                   help="本地控制端点的 unix socket（相对路径按项目根算）。"
+                        "web_server.py 的 --agent-socket 必须指向同一个地方。"
+                        "走 unix socket 而不是 TCP 端口，是为了保住"
+                        "「本进程不开任何入站 TCP 端口」这条性质")
     c.add_argument("--width", type=int, default=1280)
     c.add_argument("--height", type=int, default=720)
     c.add_argument("--fps", type=int, default=30)
     c.add_argument("--bitrate", type=int, default=2500000,
                    help="H.264 目标码率(bps)。mpph264enc 的默认值约 3.4Mbps")
-    c.add_argument("--gop", type=int, default=60,
-                   help="关键帧间隔(帧)。60 = 2 秒。别设太大："
-                        "中途加入的浏览器要等到下一个 IDR 才有画面")
+    c.add_argument("--gop", type=int, default=10,
+                   help="关键帧间隔(帧)。默认 10 —— 这个值不是随手定的，"
+                        "整条验收线都压在它上面："
+                        "  中途加入的浏览器要等到下一个 IDR 才有画面，"
+                        "  切换摄像头也是（画面最多停一个 GOP）；"
+                        "  而 60（= 2 秒）实测会让「画面静止时间占比」到 8.5%%，"
+                        "  直接超过 analyze_diag.py 的 3%% 上限 —— 也就是说"
+                        "  用默认值跑完整回归是**过不了**的。"
+                        "带宽换流畅，要省带宽就显式调大，但别指望那时回归还全绿")
 
     q = p.add_argument_group(
         "画质（板子上没有 rkaiq 3A，AE/AWB 都不会自己跑，所以由本进程兜底）")
@@ -468,7 +672,10 @@ def main(argv=None):
 
     # 画质兜底放在最前面：此刻还没有观看端、pipeline 还没建，摄像头是空的，
     # 量亮度的那个 ISP 节点不会和正在推的流抢资源。
-    camera.setup(args)
+    # 只有 quality_fix 的源（MIPI）才真的跑它 —— USB 摄像头自带 AE/AWB，
+    # 跑那套既没意义又会去写 MIPI sensor 的 subdev 控件。
+    state = AgentState(args)
+    sources.apply_quality(state.source, args, log)
 
     from gi.repository import Gst
 
@@ -482,7 +689,7 @@ def main(argv=None):
     threading.Thread(target=glib_loop.run, name="glib-main", daemon=True).start()
 
     try:
-        return asyncio.run(run_publisher(args))
+        return asyncio.run(run_forever(args, state))
     except KeyboardInterrupt:
         return 0
     finally:

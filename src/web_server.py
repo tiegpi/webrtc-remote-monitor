@@ -27,6 +27,7 @@ web_server.py —— 板子侧的观看页服务
 路由：
     /                      monitor.html
     /config.json           本服务的配置（房间号），页面拿它当默认值
+    /camera                →  device_agent（本地 unix socket，切换摄像头）
     /ice.json  /diag       →  信令服务器（原样转发）
     /ws/view               →  信令服务器（WebSocket 双向透传）
     /healthz               本服务自己的存活检查
@@ -50,6 +51,18 @@ HERE = Path(__file__).resolve().parent
 # 这些路径原样转给信令服务器。monitor.html 里用的就是这几个相对路径，
 # 所以页面代码不需要知道信令服务器到底在哪 —— 同源即可。
 PROXY_PATHS = ("/ice.json", "/diag", "/diag/clear")
+
+
+def agent_socket_path(args):
+    """device_agent 的本地控制端点在哪。
+
+    和 device_agent.socket_path() 是同一件事，刻意**不 import 过来**：
+    那个模块导入时就会碰 GStreamer（pipeline 要清 BSP 的环境变量），
+    而本服务不需要 GStreamer、也不该被它拖下水 —— 这也是 run-web.sh
+    不用 bash -l 的原因。两边靠 --agent-socket 的同一个默认值对齐。
+    """
+    p = Path(args.agent_socket)
+    return p if p.is_absolute() else (HERE.parent / p)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +249,48 @@ async def handle_ws_view(request):
 
 
 # --------------------------------------------------------------------------- #
+# 摄像头控制：同源转给 device_agent 的 unix socket
+# --------------------------------------------------------------------------- #
+async def handle_camera(request):
+    """把 /camera 转给 device_agent 的本地控制端点。
+
+    **为什么让板子中转、而不让页面直连 device_agent**：页面是 https 来的，
+    直连会同时踩上这个文件开头总结的那两个坑 —— 跨源，以及自签证书在
+    fetch() 里静默 reject（没有任何交互能让你"继续前往"）。绕一手之后，
+    浏览器这一侧只剩 web_server 一个来源，和信令那边是同一个思路。
+
+    走 unix socket 对页面完全透明：它只看到同源的 POST /camera。
+    """
+    args = request.app["args"]
+    sock = agent_socket_path(args)
+    body = await request.read()
+    headers = {}
+    if request.headers.get("Content-Type"):
+        headers["Content-Type"] = request.headers["Content-Type"]
+
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(str(sock))
+        ) as local:
+            async with local.request(
+                request.method, "http://localhost/camera",
+                data=body or None, headers=headers,
+            ) as r:
+                payload = await r.read()
+                return web.Response(
+                    body=payload,
+                    status=r.status,
+                    content_type=r.content_type or "application/json",
+                )
+    except (aiohttp.ClientError, OSError) as exc:
+        # device_agent 没跑（或者 socket 被删了）时给明确的 502。
+        # 页面那边会把这句打到日志区 —— 比一个空 200 好得多。
+        log.warning("转发 /camera 失败（%s）: %s", sock, exc)
+        raise web.HTTPBadGateway(
+            text="连不上推送端（%s）。device_agent.py 起了吗？" % sock)
+
+
+# --------------------------------------------------------------------------- #
 async def on_startup(app):
     args = app["args"]
     ctx = make_ssl_context(args)
@@ -261,6 +316,7 @@ def build_app(args):
     app.router.add_get("/healthz", handle_healthz)
     # 必须在最后那条 /{path:.*} 兜底路由**之前**注册，否则会被它当静态文件吃掉。
     app.router.add_get("/config.json", handle_config)
+    app.router.add_route("*", "/camera", handle_camera)
     app.router.add_route("*", "/ws/view", handle_ws_view)
     for p in PROXY_PATHS:
         app.router.add_route("*", p, handle_proxy)
@@ -286,6 +342,10 @@ def parse_args(argv=None):
                         "对不上的连接会被 bad-room 直接关掉")
     p.add_argument("--tls-ca", default=None,
                    help="信令服务器用自签证书时，把那张证书的路径给它")
+    p.add_argument("--agent-socket", default="run/agent.sock",
+                   help="device_agent.py 本地控制端点的 unix socket（相对路径按"
+                        "项目根算），/camera 转给它。**必须和 device_agent.py 的"
+                        "--agent-socket 一致**，否则页面上换摄像头的按钮会报 502")
     t = p.add_argument_group("本服务的 TLS（阶段二浏览器要麦克风时才需要）")
     t.add_argument("--tls-cert", default=None, help="证书链 PEM")
     t.add_argument("--tls-key", default=None, help="私钥 PEM")
@@ -313,6 +373,7 @@ def main(argv=None):
         log.warning("  房间号      : 没给 --room。页面会退回写死的默认值，"
                     "多半连不上 —— 请在命令行补上，值要和 device_agent.py 的一致")
     log.info("  媒体不经过本服务，是浏览器和板子之间直连的")
+    log.info("  摄像头切换  : POST /camera → %s", agent_socket_path(args))
     if args.tls_cert:
         log.info("  浏览器第一次打开会拦自签证书，点一次「继续前往 / 接受风险」即可")
 

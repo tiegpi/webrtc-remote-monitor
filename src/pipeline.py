@@ -12,13 +12,23 @@ pipeline.py —— GStreamer 管线描述与搭建
 反方向（浏览器 → 板子扬声器）是**运行期**才会接上的：webrtcbin 的 src pad
 要等远端描述设好才出现，所以那条链不能用描述串写死，见 attach_audio_return()。
 
-textoverlay（阶段三）在 video_branch 里加。
+管线被拆成两半，是为了支持**运行期换摄像头**（见 VideoSwitch）：
+
+    骨架（建一次，永不动）        可替换的采集段（每次切换整段换掉）
+    webrtcbin ← vq ← rtph264pay ← v4l2src ! [mppjpegdec] ! mpph264enc ! h264parse
+      ↑ 音频 aq ← rtpopuspay
+
+切分点选在 h264parse 之后，因为编码输出是两路唯一必须一致的东西 ——
+一致就不用重新协商，这是"瞬时切换"的全部依据。
+
+textoverlay（阶段三）在 segment_desc 里加。
 
 **本模块必须在 Gst.init() 之前被导入**，理由见下面那段环境变量处理。
 """
 
 import os
 
+import sources
 import whitebalance
 
 # --------------------------------------------------------------------------- #
@@ -42,9 +52,9 @@ import whitebalance
 _LIBV4L2_ENV = "GST_V4L2_USE_LIBV4L2"
 LIBV4L2_WAS_FORCED = os.environ.pop(_LIBV4L2_ENV, None) is not None
 
-# 视频分支里用的原始格式。MIPI ISP 的原生输出就是 UYVY，textoverlay 和
-# mpph264enc 都直接吃它，中间一个 videoconvert 都不需要（实测确认过）。
-VIDEO_FORMAT = "UYVY"
+# 视频分支里用的原始格式现在归 src/sources.py 管（每个源一个 fourcc）：
+# MIPI ISP 的原生输出就是 UYVY，USB 摄像头出 MJPG。两路都直接喂 mpph264enc，
+# 中间一个 videoconvert 都不需要（实测确认过）。
 
 # RTP 载荷类型。选 102 而不是常见的 96，是为了避开同时抓包时和别的流看混。
 PT_VIDEO = 102
@@ -89,22 +99,68 @@ def guess_local_ip():
 # --------------------------------------------------------------------------- #
 # 分支描述
 # --------------------------------------------------------------------------- #
-def _raw_caps(a):
-    """摄像头原生格式的 caps。桥的两头都要写死同一份，别各写一遍。"""
-    return ("video/x-raw,format={fmt},width={w},height={h},framerate={fps}/1"
-            .format(fmt=VIDEO_FORMAT, w=a.width, h=a.height, fps=a.fps))
+def raw_caps(a, src):
+    """摄像头原生 raw 格式的 caps。桥的两头都要写死同一份，别各写一遍。
 
-
-def video_branch(a):
-    """视频分支：摄像头 → 硬件 H.264 → RTP。
-
-    末尾那个 queue 是**必须**的，而且它的参数不能乱改，见下面注释。
-
-    `--camera-wb` 时，摄像头和编码器之间会被**拆成两条互不相连的 chain**，
-    中间由 whitebalance.WhiteBalanceBridge 的线程接起来。拆的是描述串，
-    和别的元素没关系 —— 除了多一个 appsink/appsrc，链路对上下两端完全一样。
+    宽高帧率取自 args 而**不是**取自这个源：两路必须出同一份 caps，
+    理由见 sources.py 开头那段（切换不用重新协商就依赖这一点）。
     """
-    head = "v4l2src device={cam} ! {caps} ! ".format(cam=a.camera, caps=_raw_caps(a))
+    return ("video/x-raw,format={fmt},width={w},height={h},framerate={fps}/1"
+            .format(fmt=src.fourcc, w=a.width, h=a.height, fps=a.fps))
+
+
+def input_caps(a, src):
+    """在 v4l2src 上要求摄像头出什么格式。
+
+    MIPI 直接出原始 YUV；USB 摄像头出 MJPG —— 后者在 USB2 上便宜得多，
+    代价是多一个解码器（mppjpegdec 是硬解，出 NV12，mpph264enc 直接吃）。
+    """
+    if src.kind == "mjpeg":
+        return ("image/jpeg,width={w},height={h},framerate={fps}/1"
+                .format(w=a.width, h=a.height, fps=a.fps))
+    return raw_caps(a, src)
+
+
+def video_tail(a):
+    """视频分支的**尾段**：编码好的 H.264 → RTP → 队列。这部分常驻骨架。
+
+    **`rtph264pay` 不能跟着采集段一起换。** RTP 的时间戳基准（90kHz 映射 +
+    随机初值）和 SSRC 都由它维持；留在骨架里，切换摄像头时它们不会重来一遍，
+    浏览器就不会把新画面当成一路新流、把 jitterbuffer 清空重来。
+    会打乱 PTS 的只有重建**顶层** pipeline（那会拿到新的 base time），
+    而换采集段恰好避开了这一点 —— 所以切换不需要任何时间戳补偿代码。
+    """
+    return (
+        # config-interval=-1 = 每个 IDR 帧都重发一次 SPS/PPS。
+        # 这个属性在 rtph264pay 上（默认是 0=完全关闭），**不是在 h264parse 上**。
+        # 忘了设的症状：第一个观看者正常，之后进来的一律黑屏。
+        "rtph264pay name=vpay pt={pt} mtu=1200 config-interval=-1 ! "
+        "application/x-rtp,media=video,encoding-name=H264,payload={pt},"
+        "clock-rate=90000 ! "
+        # 绝不能写成 max-size-buffers=1 leaky=downstream。
+        # RTP 是逐包推送的，队列只留 1 个 buffer，webrtcbin 稍慢一点就丢包，
+        # 接收端的症状是"收到 RTP 包但 depay 解不出任何一帧"。
+        "queue name=vq max-size-buffers=200 max-size-bytes=0 max-size-time=0"
+    ).format(pt=PT_VIDEO)
+
+
+def segment_desc(a, src):
+    """可替换的**采集段**：v4l2src → 硬件 H.264 → h264parse。
+
+    终端元素显式命名成 `vtail`：VideoSegment 靠它找 ghost pad 的目标。
+    不命名就只能靠 parse 自动生成的 `h264parse0/1` 去猜 —— 换一次源就多一个
+    编号，那是个没必要留的坑。
+
+    `--camera-wb` 时（且只对 raw 源），摄像头和编码器之间会被**拆成两条互不
+    相连的 chain**，中间由 whitebalance.WhiteBalanceBridge 的线程接起来。
+    拆的是描述串，和别的元素没关系 —— 除了多一个 appsink/appsrc，链路对上下
+    两端完全一样。USB 那路是 MJPG，桥按 4 字节 UYVY 解包（correct_uyvy），
+    对它没有意义，所以整条跳过。
+    """
+    head = "v4l2src name=vsrc0 device={dev} ! {caps} ! ".format(
+        dev=src.device, caps=input_caps(a, src))
+    if src.kind == "mjpeg":
+        head += "mppjpegdec ! "
 
     tail = (
         # profile/level 必须显式写。mpph264enc 默认给的是 High profile
@@ -117,28 +173,31 @@ def video_branch(a):
         # gop：关键帧间隔。这个值不能省，因为 config-interval=-1 只在**确实有
         # 关键帧**时才有用，否则中途加入的浏览器永远等不到 SPS/PPS，表现是一直黑屏。
         "mpph264enc profile=baseline level=31 gop={gop} bps={bps} rc-mode=cbr ! "
-        "h264parse ! "
-        # config-interval=-1 = 每个 IDR 帧都重发一次 SPS/PPS。
-        # 这个属性在 rtph264pay 上（默认是 0=完全关闭），**不是在 h264parse 上**。
-        # 忘了设的症状：第一个观看者正常，之后进来的一律黑屏。
-        "rtph264pay name=vpay pt={pt} mtu=1200 config-interval=-1 ! "
-        "application/x-rtp,media=video,encoding-name=H264,payload={pt},"
-        "clock-rate=90000 ! "
-        # 绝不能写成 max-size-buffers=1 leaky=downstream。
-        # RTP 是逐包推送的，队列只留 1 个 buffer，webrtcbin 稍慢一点就丢包，
-        # 接收端的症状是"收到 RTP 包但 depay 解不出任何一帧"。
-        "queue name=vq max-size-buffers=200 max-size-bytes=0 max-size-time=0"
-    ).format(gop=a.gop, bps=a.bitrate, pt=PT_VIDEO)
+        "h264parse name=vtail"
+    ).format(gop=a.gop, bps=a.bitrate)
 
-    if not getattr(a, "camera_wb", None):
+    if src.kind != "raw" or not getattr(a, "camera_wb", None):
         return head + tail
 
     # 管线本来就是 UYVY，桥也工作在 UYVY 域 —— 所以这里**一次 videoconvert 都不需要**，
     # 摄像头出来的字节原样进 appsink、校正完原样进编码器。
     return (head
             + whitebalance.WB_SINK_DESC
-            + whitebalance.WB_SRC_DESC.format(caps=_raw_caps(a))
+            + whitebalance.WB_SRC_DESC.format(caps=raw_caps(a, src))
             + tail)
+
+
+def skeleton_desc(a):
+    """常驻骨架：webrtcbin + 视频尾段 +（可选）音频分支。
+
+    建一次就不再动。切换摄像头时被整段替换掉的只有采集段，
+    所以挂在这上面的东西（vpay 的统计探针、vq→sink_0、音频、回程链）
+    全都不受影响。
+    """
+    desc = "webrtcbin name=wbr bundle-policy=max-bundle " + video_tail(a)
+    if audio_enabled(a):
+        desc += " " + audio_branch(a)
+    return desc
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +219,7 @@ def audio_branch(a):
     张卡直接协商失败（报 "Channels count not available"）。让 alsasrc 用它自己
     的格式出来，downmix 交给 audioconvert。
 
-    末尾 queue 的理由和视频那路一样，见 video_branch 的注释。
+    末尾 queue 的理由和视频那路一样，见 video_tail 的注释。
     """
     return (
         "alsasrc device={mic} ! "
@@ -359,45 +418,289 @@ def apply_ice(webrtcbin, ice, log):
         log.info("未配置 STUN/TURN，只用 host candidate（同网段可用）")
 
 
-def build(a, ice, log, on_audio_elements=None):
-    """搭出整条管线，返回 (pipeline, webrtcbin, wb)。
+def confirm_null(el, what, log):
+    """元素（或 bin）从 NULL 回来之后，确认它**真的**到了 NULL；没到就把卡住的点名。
+
+    为什么值得专门写一段：设备 fd 是在采集元素的 PAUSED→READY 里还回去的，
+    所以"状态没走到 NULL"和"摄像头一直被占着"是同一件事的两种说法。而这件事
+    **不会**通过别的渠道暴露 —— 日志上没有错误、会话照常关掉、下一轮还能看，
+    唯有 `fuser /dev/video11`（或几十轮之后 fd 耗尽）能发现。
+
+    实测（板子上，2026-10-14）：一个**不含本项目代码**的裸 pipeline
+    `v4l2src device=/dev/video11 ! ... ! fakesink`，PLAYING 时这个设备上挂着
+    **2 个** fd（v4l2src 自己开两次，flags 都是 0x400002），进 NULL 之后
+    **2 个全还**。所以"运行中 2 个"是正常的，剩 1 个才是问题 —— 而且问题一定
+    出在这条链上某个元素没走完 NULL，不在"谁没析构"。
+    """
+    from gi.repository import Gst
+
+    ret, state, pending = el.get_state(0)
+    if state == Gst.State.NULL and pending == Gst.State.VOID_PENDING:
+        log.debug("%s 已到 NULL", what)
+        return True
+
+    log.warning("%s 没到 NULL（%s，当前 %s / 待 %s），卡住的元素：",
+                what, ret.value_nick, state.value_nick, pending.value_nick)
+    try:
+        it = el.iterate_recurse()
+        while True:
+            ok, child = it.next()
+            if ok != Gst.IteratorResult.OK:
+                break
+            cret, cstate, _cp = child.get_state(0)
+            if cstate != Gst.State.NULL:
+                fac = child.get_factory()
+                log.warning("  %s（%s）→ %s / 当前 %s",
+                            child.get_name(),
+                            fac.get_name() if fac else "?",
+                            cret.value_nick, cstate.value_nick)
+    except Exception:                                # noqa: BLE001
+        # 这段只是诊断，绝不能让"报不出来"变成"拆会话失败"。
+        log.exception("列卡住的元素时出错（不影响拆会话）")
+    return False
+
+
+class VideoSegment:
+    """一段采集链：v4l2src → [解码器] → 编码器 → h264parse(name=vtail)。
+
+    整段随时可以被换掉，这就是"切换摄像头不用重新协商"的来源 ——
+    骨架里的 webrtcbin / rtph264pay / 音频分支一个都不动。
+
+    只由 VideoSwitch 创建和销毁，**只能在 GLib 线程碰**。
+    """
+
+    def __init__(self, a, src, log):
+        from gi.repository import Gst
+
+        if src.kind == "raw" and getattr(a, "camera_wb", None):
+            # 必须早于 parse：GstApp 没 import 的话，PyGObject 会按 GObject 类型
+            # 缓存包装对象，get_by_name("wbsink") 拿到的是个没有 try_pull_sample
+            # 的秃 Element，之后再 import 也换不回来。见 whitebalance.prepare()。
+            whitebalance.prepare()
+
+        desc = segment_desc(a, src)
+        self.bin = Gst.parse_bin_from_description(desc, False)
+        if self.bin is None:
+            raise RuntimeError("采集段建不出来（源 %s）：%s" % (src.name, desc))
+        self.src = src
+
+        vtail = self.bin.get_by_name("vtail")
+        if vtail is None:
+            raise RuntimeError("采集段里没有 vtail（描述串写错了？）：%s" % desc)
+
+        # ghost 必须在**还没接进骨架**的时候建：Gst.GhostPad.new() 断言目标 pad
+        # 未连接（"assertion '!gst_pad_is_linked (target)' failed"，实测）。
+        # 所以顺序永远是 先 parse 出独立 bin → 再 ghost → 最后才 link 到 vpay。
+        self.pad = Gst.GhostPad.new("src", vtail.get_static_pad("src"))
+        if self.pad is None:
+            raise RuntimeError("ghost pad 建不出来（目标 pad 已经连上了？）")
+        if not self.bin.add_pad(self.pad):
+            raise RuntimeError("ghost pad 挂不上采集段")
+        # **实测踩过**：new() 出来的 ghost pad 默认是**非激活**的，add_pad()
+        # 之后仍然不激活。漏了这一步，link() 返回 WRONG_HIERARCHY ——
+        # 不报错、不出数据、日志干干净净，症状就是"切过去一片黑，什么都不说"。
+        self.pad.set_active(True)
+
+        # 桥的两头在描述串里是**空开**的（见 segment_desc），接起来的是这个对象。
+        self.wb = None
+        wsink = self.bin.get_by_name("wbsink")
+        if wsink is not None:
+            self.wb = whitebalance.WhiteBalanceBridge(
+                wsink, self.bin.get_by_name("wbsrc"), a.camera_wb)
+            log.info("%s", self.wb.describe())
+
+    def start_bridge(self):
+        if self.wb is not None:
+            self.wb.start()
+
+    def teardown(self, pipeline, peer_sink, log):
+        """把这一段从运行中的管线上摘下来。
+
+        步骤顺序是硬性的，不能图省事重排：
+
+        1. 先 `set_state(NULL)` 并**等它真的到 NULL**。NULL 会把 appsrc flush
+           掉，卡在满队列 push_buffer 上的桥线程才会立刻返回。写反了
+           （先 stop 再 NULL）join 会一直等到超时，随后 remove() 掉一个线程
+           还在摸的 bin —— 那是未定义行为，不是"慢一点"。
+        2. 然后才收桥线程。
+        3. 最后 unlink + remove。这时设备节点也已经释放了，下一个源才打得开。
+        """
+        from gi.repository import Gst
+
+        self.bin.set_state(Gst.State.NULL)
+        self.bin.get_state(2 * Gst.SECOND)
+        confirm_null(self.bin, "拆下来的旧段", log)
+
+        if self.wb is not None:
+            self.wb.stop()
+            self.wb = None
+
+        self.pad.set_active(False)
+        self.pad.unlink(peer_sink)
+        pipeline.remove(self.bin)
+
+
+class VideoSwitch:
+    """骨架 + 当前那段采集。**所有方法都只能在 GLib 线程调用。**
+
+    在 PLAYING 的管线里加删元素会碰 GStreamer 的状态机和 streaming 线程，
+    从别的线程调是未定义行为 —— 外部（HTTP 控制端点）要用 GLib.idle_add 投进来。
+    """
+
+    def __init__(self, pipeline, pay_sink, a, log):
+        from gi.repository import Gst
+
+        self._Gst = Gst
+        self.pipeline = pipeline
+        self.pay_sink = pay_sink     # rtph264pay 的 sink pad，在骨架里，永不变
+        self.a = a
+        self.log = log
+        self.current = None
+        self.n_switches = 0
+
+    @property
+    def source(self):
+        return self.current.src if self.current is not None else None
+
+    def attach_first(self, src):
+        """接上第一个采集段。**不** sync 状态 —— 由 session.start() 的
+        set_state(PLAYING) 统一带上去，路径更少，语义只有一种。"""
+        Gst = self._Gst
+        seg = VideoSegment(self.a, src, self.log)
+        self.pipeline.add(seg.bin)
+        if seg.pad.link(self.pay_sink) != Gst.PadLinkReturn.OK:
+            self.pipeline.remove(seg.bin)
+            raise RuntimeError("采集段接不上 rtph264pay（源 %s）" % src.name)
+        self.current = seg
+        self.log.info("视频源：%s（%s，%s %dx%d@%d）", src.name, src.device,
+                      src.fourcc, self.a.width, self.a.height, self.a.fps)
+
+    def switch(self, name):
+        """换一路摄像头。返回最终生效的源名。"""
+        Gst = self._Gst
+        src = sources.resolve(name)
+        if self.current is not None and self.current.src.name == src.name:
+            return src.name          # 已经在这一路上，不做无谓的重建（画面不会闪）
+
+        # **先造新的再拆旧的。** parse_bin_from_description 不碰硬件，元素缺失
+        # 或者描述串写错都会在这里抛出来，此时旧段毫发无损 —— 最便宜的回滚。
+        seg = VideoSegment(self.a, src, self.log)
+
+        old = self.current
+        if old is not None:
+            old.teardown(self.pipeline, self.pay_sink, self.log)
+
+        self.pipeline.add(seg.bin)
+        if seg.pad.link(self.pay_sink) != Gst.PadLinkReturn.OK:
+            # 新段接不上。**重建**一路旧源装回去，而不是把刚才拆掉的那个 bin
+            # 重新 add 回来：teardown() 已经把它 set_state(NULL)、收掉桥线程、
+            # 把 ghost pad 置为非激活，原地复活会留下一个"接上了但桥不转了"的段
+            # —— 比直接报错更难查。这条路正常永远走不到（两路编码输出 caps
+            # 相同，pay_sink 此时也确实是空的），留着是为了不把管线扔在
+            # "没有视频源"的状态里。
+            self.pipeline.remove(seg.bin)
+            self.current = None
+            if old is not None:
+                try:
+                    back = VideoSegment(self.a, old.src, self.log)
+                    self.pipeline.add(back.bin)
+                    back.pad.link(self.pay_sink)
+                    back.bin.sync_state_with_parent()
+                    back.start_bridge()
+                    self.current = back
+                    self.log.warning("新段接不上，已退回 %s", old.src.name)
+                except Exception:               # noqa: BLE001
+                    self.log.exception("退回 %s 也失败了，现在没有视频源", old.src.name)
+            raise RuntimeError("采集段接不上 rtph264pay（源 %s）" % src.name)
+
+        # **先 link 再 sync。** 反过来新的 v4l2src 会在还没有下游的时候开始推，
+        # mpph264enc/h264parse 拿 GST_FLOW_NOT_LINKED，这条错误经 bus 冒出来，
+        # 表现成"一换源就报 GStreamer 错误"。
+        seg.bin.sync_state_with_parent()
+        seg.start_bridge()
+        self.current = seg
+        self.n_switches += 1
+        self.log.info("视频源已切到 %s（%s）", src.name, src.device)
+        return src.name
+
+    def start_bridges(self):
+        """首段的桥线程。要等 pipeline 真的进 PLAYING 才起 —— 理由见 session.py。"""
+        if self.current is not None:
+            self.current.start_bridge()
+
+    def dispose(self):
+        """整个管线要拆掉了。先 NULL（flush 掉 appsrc）再收桥线程，线程不用等
+        超时；NULL 之后 `get_state()` 等它真的到 NULL；最后把采集段从管道里摘掉。
+
+        **为什么最后那一步是必须的** —— 这是设备 fd 每轮会话漏一个的真正原因，
+        板子上量出来的。中间试错过好几次，把结论和错路都记在下面。
+
+        现象：跑一次会话，`/dev/video11` 上留下一个 fd 不还（0 → 2 → 1，每轮 +1），
+        几十轮之后 fd 耗尽，MIPI 传感器一直被占着不放。
+
+        根因分两步量出来：
+
+        1. **fd 是被 appsink 攥着的。** 对照实验（不含本项目代码的最小 pipeline）：
+           `v4l2src ! fakesink`、以及 `v4l2src ! appsink` 但**没人拉过 sample**，
+           进 NULL 之后设备 fd **全还**；只要**拉过** sample，就剩 1 个。
+           那个 fd 属于 v4l2 的 **buffer pool**：只要还有一个 buffer 没析构，
+           pool 就析构不了，pool 就攥着设备 fd。而 appsink 拉过 sample 之后会
+           一直攥着一个 buffer —— `appsink.run_dispose()` 能立刻把它还回来
+           （GStreamer 为此外加一条 CRITICAL：不该绕过父对象析构），
+           说明东西就在 appsink 里。
+
+        2. **appsink 析构不了，是因为 pipeline 析构不了。** `gc.get_referrers`
+           点名：pipeline 被闭包格子抓着，其中一个是 `attach_audio_return()` 里
+           的 `connect()`（它捕获了 `pipeline`），而这个闭包由 C 侧的 signal
+           handler / pad probe 抓着。**这条环横跨 C 和 Python，CPython 的 gc
+           穿不过去** —— 把引用全丢掉再 `gc.collect()`，探针实测 pipeline 仍然活着。
+
+        于是 pipeline → bin → appsink → buffer → pool → 设备 fd，一整条链谁也松不了
+        手。**在拆会话时把采集段从管道里摘掉**就把这条链断在最上面一环：段不再挂在
+        管道上、也没有别的引用 → 段析构 → appsink 析构 → buffer 松手 → pool 析构
+        → fd 还回去。实测摘之前每轮漏一个、摘之后归零（连续 3 轮 0 个）。
+
+        这也解释了为什么**切换摄像头从来不漏**：那条路本来就走
+        `VideoSegment.teardown()`，里面就有 `pipeline.remove(self.bin)`。
+        两个出口本来就该走同一条路。
+
+        （试过但**没用**的，都记下来免得下次再走一遍：NULL 之后加 `get_state()`
+        等待、摘掉 bus 的 signal watch、appsink 的 `enable-last-sample=false`、
+        以及 `pipeline.run_dispose()` —— 它们都不破上面那个环，环在最上面一环。
+        `confirm_null()` 留着，它证明过 pipeline 确实干净地到了 NULL，把状态机
+        这一支排除掉了；哪天再漏，它会直接点名卡住的元素。）
+        """
+        self.pipeline.set_state(self._Gst.State.NULL)
+        self.pipeline.get_state(2 * self._Gst.SECOND)
+        confirm_null(self.pipeline, "整条 pipeline", self.log)
+        if self.current is not None:
+            # 摘掉采集段 —— fd 能不能还回去就看这一步，理由见上面 docstring。
+            # 走 teardown() 而不是重写一遍，是为了和切换那条路永远是同一段代码。
+            self.current.teardown(self.pipeline, self.pay_sink, self.log)
+            self.current = None
+
+
+def build(a, ice, log, source, on_audio_elements=None):
+    """搭出整条管线，返回 (pipeline, webrtcbin, switch)。
 
     webrtcbin 的 sink pad 是 **request pad**，parse_launch 连不了，
     所以这里把 webrtcbin 和各分支并列写在描述串里，链接留到下面手动做。
 
-    wb 是白平衡桥对象（没开 --camera-wb 时是 None）。它的线程**不在这里起** ——
-    要等 pipeline 进 PLAYING、真的有帧了再起，见 session.py。
+    source 是初始的采集源。骨架建好之后由 VideoSwitch.attach_first() 接上去 ——
+    **第一段一定要在建 pipeline 的时候就在**，别留一个"进了 PLAYING 但还没有
+    视频生产者"的时间窗。
 
     on_audio_elements 在**回程链建出来之后**被调用（参数是 {名字: 元素}），
     给 session.py 挂统计探针用。回程链是运行期才建的，所以只能回调，不能返回。
     """
     from gi.repository import Gst
 
-    if getattr(a, "camera_wb", None):
-        # 必须赶在 parse_launch 之前：GstApp 没 import 的话，下面 get_by_name
-        # 拿到的 wbsink 是个没有 try_pull_sample 的秃 Element，见 whitebalance。
-        whitebalance.prepare()
-
-    # 分支串先各自 format 好再拼。不要写成一整条大字符串最后统一 .format()：
-    # 用户给的设备路径里万一带了 '{' / '}'，会被后面的 .format() 当成占位符再解释一遍。
-    desc = "webrtcbin name=wbr bundle-policy=max-bundle " + video_branch(a)
-    if audio_enabled(a):
-        desc += " " + audio_branch(a)
-
-    pipeline = Gst.parse_launch(desc)
+    pipeline = Gst.parse_launch(skeleton_desc(a))
     webrtcbin = pipeline.get_by_name("wbr")
     if webrtcbin is None:
         raise RuntimeError("描述串里没找到 webrtcbin，parse_launch 可能失败了")
 
     apply_ice(webrtcbin, ice, log)
-
-    # 桥的两头在描述串里是**空开**的（见 video_branch），接起来的是这个对象。
-    wb = None
-    wbsink = pipeline.get_by_name("wbsink")
-    if wbsink is not None:
-        wb = whitebalance.WhiteBalanceBridge(
-            wbsink, pipeline.get_by_name("wbsrc"), a.camera_wb)
-        log.info("%s", wb.describe())
 
     # sink 编号决定 m-line 顺序，也就决定浏览器 offer/answer 里的顺序。
     # 视频固定占 sink_0、音频固定占 sink_1，两边永远对得上。
@@ -413,7 +716,17 @@ def build(a, ice, log, on_audio_elements=None):
         # 这里只是把回调挂上，真正建链在 attach_audio_return 里。
         attach_audio_return(webrtcbin, pipeline, a, log, on_audio_elements)
 
-    return pipeline, webrtcbin, wb
+    switch = VideoSwitch(pipeline, pipeline.get_by_name("vpay").get_static_pad("sink"),
+                         a, log)
+    try:
+        switch.attach_first(source)
+    except Exception:
+        # 采集段建不出来（设备不存在 / caps 不支持）时，别把一个已经进到
+        # READY 的管线漏在这儿 —— 它会占着设备节点。
+        pipeline.set_state(Gst.State.NULL)
+        raise
+
+    return pipeline, webrtcbin, switch
 
 
 def _link(pipeline, webrtcbin, queue_name, pad_name):

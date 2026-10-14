@@ -30,6 +30,13 @@
   button:disabled{ opacity:.45; cursor:default; }
   button.on{ background:#1f4d33; border-color:var(--ok); color:var(--ok); }
   #talkHint { color:var(--dim); font-size:12px; }
+  /* 摄像头分段按钮。用现成的 button + .on 激活态，不引 select —— 两个选项
+     时按钮更直观，而且 .on 那套已经在「开始对讲」上用着了，样式是白拿的。 */
+  .cams { display:flex; gap:6px; align-items:center; }
+  .cams::before {
+    content:"摄像头"; color:var(--dim); font-size:12px; margin-right:2px;
+  }
+  .cams:empty { display:none; }
   .stage { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:12px; }
   @media (max-width:900px){ .stage{grid-template-columns:1fr} }
   video {
@@ -55,6 +62,9 @@
   <span id="roomLabel">房间 —</span>
   <button id="talkBtn">开始对讲</button>
   <span id="talkHint">点了之后浏览器才会申请麦克风</span>
+  <!-- 摄像头按钮由 loadCameras() 按板子给的清单生成（GET /camera）。
+       清单为空时 .cams:empty 会整块隐藏，不留一个空标签。 -->
+  <span class="cams" id="cams"></span>
   <span id="status" class="status">未连接</span>
 </div>
 
@@ -94,10 +104,18 @@ let iceServers = [];          // 从 /ice.json 拿到的 STUN/TURN 配置
 // 样本里新字段是空的 —— 分不清是"用户没刷"、"浏览器吃了缓存"还是"我字段名
 // 写错了"。有了版本号，样本自己就说得出跑的是哪版 JS，不用再靠 md5 猜。
 // 每次改这个文件都要动这里。
-const PAGE_VERSION = "2026-10-14.2";
+const PAGE_VERSION = "2026-10-14.5";
 
 let lastStats = null;         // 最近一次完整样本，供 diag 上报
 const pendingCandidates = []; // setRemoteDescription 之前到达的候选先缓存
+
+// 摄像头切换（板子上接了两个，一次只推一路）。
+// 页面**不创建、不重建、不碰 PeerConnection** —— 切换发生在板子的管线内部，
+// 编码输出是同一份 caps，所以既没有新 offer，ontrack 也不会再触发，
+// video.srcObject 一直有效。这里要做的只有按钮高亮和把错误打出来。
+let cams = [];                // 板子给的清单，含 present
+let currentCam = null;        // 当前这一路（板子说了算，不是页面自己记的）
+let camBusy = false;          // 串行化，防连点
 
 // 浏览器的麦克风。**必须在 setRemoteDescription 之前**加进 pc —— 见 startTalk
 // 和 createPc 里的说明，这是阶段二最容易踩的一个顺序问题。
@@ -155,6 +173,207 @@ async function loadIceServers() {
     // 局域网模式 --ice-mode none 时 /ice.json 仍然存在，只是 iceServers 为空，
     // 所以走到这里通常意味着页面不是从信令服务器加载的。
     log("取 /ice.json 失败（" + e.message + "），按无 STUN/TURN 处理");
+  }
+}
+
+/* ------------------------------------------------------------ 摄像头切换
+
+   板子上的 device_agent 通过 unix socket 提供一个本地控制端点，web_server
+   把它同源代理成 /camera。页面**不直接连 device_agent** —— 那是跨源，
+   而且会撞上自签证书在 fetch() 里静默 reject 那个坑（见文件头的说明）。
+
+   清单走独立的 /camera 而不是塞进 /config.json：resolveRoom() 在 URL 带
+   ?room= 时会提前 return、根本不 fetch /config.json  —— 塞那儿的话，
+   演示时一加 ?room= 按钮就空了。 */
+async function loadCameras(quiet) {
+  try {
+    const r = await fetch("./camera", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    const prev = currentCam;
+    cams = j.available || [];
+    currentCam = j.current || null;
+    renderCams();
+    // 变了才记账。prev 为 null 是首次加载（页面还不知道原来是谁），不算切换。
+    if (prev !== null && currentCam !== prev) noteSourceChanged();
+    if (!quiet) {
+      log("摄像头：" + cams.map((c) => c.label + (c.present ? "" : "（没插）")).join("、")
+          + "，当前 " + currentCam);
+    }
+  } catch (e) {
+    if (!quiet) {
+      log("取摄像头列表失败（" + e.message + "）—— 不显示切换按钮。"
+          + "板子上 device_agent.py 起了吗？");
+    }
+  }
+}
+
+function renderCams() {
+  const box = $("cams");
+  // 轮询每 2 秒会调到这里一次。**内容没变就别重建 DOM** —— 重建会丢掉
+  // 悬停中的 tooltip，还可能把用户正按下的那一下点掉。
+  const sig = JSON.stringify([currentCam, camBusy,
+                              cams.map((c) => [c.name, c.label, c.present, c.hint])]);
+  if (sig === renderCams.sig) return;
+  renderCams.sig = sig;
+  box.textContent = "";
+  for (const c of cams) {
+    const b = document.createElement("button");
+    b.textContent = c.label;
+    b.className = c.name === currentCam ? "on" : "";
+    b.disabled = camBusy || !c.present;
+    // 设备节点不在 = 摄像头没插。置灰而不是藏起来：藏起来的话，
+    // "为什么少了一个按钮"和"这个功能没做"长得一样。
+    b.title = c.present ? (c.hint || "") : `设备 ${c.device} 不存在（摄像头没插好？）`;
+    b.addEventListener("click", () => {
+      switchCam(c.name).catch((e) => log("switchCam 抛异常: " + e.message));
+    });
+    box.appendChild(b);
+  }
+}
+
+async function switchCam(name) {
+  if (camBusy || name === currentCam) return;
+  camBusy = true;
+  markSwitchStart();
+  renderCams();
+  log(`切换摄像头 → ${name} …`);
+
+  const t0 = performance.now();
+  try {
+    const r = await fetch("./camera", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body.ok) {
+      log(`切换失败（HTTP ${r.status}）：${body.error || "服务器没说原因"}`);
+    } else if (body.applied) {
+      currentCam = body.current;
+      log(`已切到 ${currentCam}（板子侧用时 ${Math.round(performance.now() - t0)} ms）。`
+          + "不重新协商，画面最多停到下一个关键帧");
+    } else {
+      // 没有观看端时板子只记住选择，等下一个观看端接入才建管线。
+      currentCam = body.current;
+      log(`记下了 ${currentCam}；现在没有观看端，等它接入时按这个建流`
+          + (body.note ? `（${body.note}）` : ""));
+    }
+  } catch (e) {
+    log("切换请求失败: " + e.message);
+  } finally {
+    camBusy = false;
+    renderCams();
+  }
+}
+
+/* -------------------------------------------------- 验证用探针（不改行为）
+
+   两个都不用看人眼就能判断"画面真的换了一路"，而且都不受 1Hz 采样地板的
+   限制 —— 这个项目在冻结指标上已经吃过一次"采样法少算 2.5 倍"的亏。 */
+
+/* 出帧间隔。用 requestVideoFrameCallback 逐帧记账，所以间隔是**精确的**，
+   不是从 1Hz 的样本里反推的。
+
+   "这次切换停顿了多久"是**事后**从最近几秒的间隔里挑最大值算出来的，
+   不是在切换那一刻打个标记。理由：打标记只有页面自己发起切换时才打得准，
+   而 tools/check_switch.sh 是用 curl 发起的 —— 标记永远打不上，停顿恒为 0，
+   "停顿 < 1 秒"就变成一条**自己把自己证明掉**的判据。事后算则不管谁发起的、
+   也不管页面晚多久才发现，都算得出来。
+
+   注意：页面被切到后台时浏览器会停掉这个回调，那段时间的空档不是卡顿。 */
+const frameGap = {
+  last: 0, max: 0, n: 0,
+  markT: 0, markMax: 0,   // 正向标记：页面自己发起切换时用
+  recent: [],             // 最近几秒每一帧的 [时刻, 间隔]，用来事后算
+  stallMs: null,          // 事后回看算出的停顿（别人发起的切换）
+};
+const STALL_LOOKBACK = 4000;   // 回看多久。要盖住"页面发现得比切换晚"的那段
+function onVideoFrame(now) {
+  if (frameGap.last) {
+    const gap = now - frameGap.last;
+    if (gap > frameGap.max) frameGap.max = gap;
+    if (frameGap.markT && now >= frameGap.markT && gap > frameGap.markMax) {
+      frameGap.markMax = gap;
+    }
+    frameGap.recent.push([now, gap]);
+  }
+  frameGap.last = now;
+  frameGap.n++;
+  const cut = now - STALL_LOOKBACK;
+  while (frameGap.recent.length && frameGap.recent[0][0] < cut) frameGap.recent.shift();
+  video.requestVideoFrameCallback(onVideoFrame);
+}
+
+/* 页面自己发起切换时，在 POST **之前**打一个正向标记：停顿发生在响应之后，
+   所以只有往前看才量得到。 */
+function markSwitchStart() {
+  frameGap.markT = performance.now();
+  frameGap.markMax = 0;
+}
+
+/* 发现"当前源跟上次看到的不一样"时调一次：回看最近几秒，取最大间隔。
+   这就是那一次切换造成的画面停顿 —— 含我们自己的轮询延迟，所以是上界。 */
+function noteSourceChanged() {
+  const now = performance.now();
+  const from = now - STALL_LOOKBACK;
+  let worst = 0;
+  for (const [t, gap] of frameGap.recent) if (t >= from && gap > worst) worst = gap;
+  frameGap.stallMs = Math.round(worst);
+  // 回看窗口里如果本来就有一处卡顿，这里会把它的账算到切换头上 ——
+  // 偏保守的方向（可能高报），对"停顿 ≤1 秒"这种判据是可接受的。
+  log(`发现当前源变了，回看 ${STALL_LOOKBACK / 1000} 秒内最长间隔 `
+      + `${frameGap.stallMs} ms（含页面发现的延迟，是上界）`);
+}
+
+/* 报出去的停顿：两个来源取大的那个。
+   按钮发起 → markMax 有值；curl 发起 → stallMs 有值。两个都没发生过就是 null，
+   而不是 0 —— "没测到"和"停顿 0 毫秒"必须能区分开，否则判据会自证通过。 */
+function stallMs() {
+  const v = Math.max(frameGap.markMax || 0, frameGap.stallMs || 0);
+  return v > 0 ? Math.round(v) : null;
+}
+// 只注册一次。没有媒体时它不回调，有新流进来就继续 —— 所以
+// teardownPc / 重连都不用管它。
+if (video.requestVideoFrameCallback) {
+  video.requestVideoFrameCallback(onVideoFrame);
+} else {
+  log("这个浏览器不支持 requestVideoFrameCallback，切换停顿的毫秒数测不了");
+}
+
+/* 画面采样：亮度均值 + 一张 32×18 的缩略图（每格一个亮度字节，base64）。
+   采样只在 postDiag 里做（1Hz），不是每帧都画 —— 那是为了验证，不是功能。
+   MediaStream 画到 canvas **不会**污染画布，getImageData 可用。
+
+   为什么要缩略图而不只是均值：**均值会被两个摄像头"恰好一样亮"骗过去**，
+   而两路画面是不是同一路，本质上是**逐像素**的问题。有了缩略图，
+   验收脚本就能自己给自己定标 —— 拿同一路的前后两帧算一个"噪声底"，
+   再拿跨切换的两帧算一个差值，要求后者远大于前者。板子就算撒谎说切了、
+   实际还推原来那路，跨切换差值也只等于噪声底，判据当场就红。
+   缩略图还能直接打成 ASCII 给人看：换没换，眼睛认一下就知道了。 */
+const SAMP_W = 32, SAMP_H = 18;
+const sampCanvas = document.createElement("canvas");
+sampCanvas.width = SAMP_W; sampCanvas.height = SAMP_H;
+const sampCtx = sampCanvas.getContext("2d", { willReadFrequently: true });
+
+function sampleFrame() {
+  if (!video.videoWidth) return null;
+  try {
+    sampCtx.drawImage(video, 0, 0, SAMP_W, SAMP_H);
+    const d = sampCtx.getImageData(0, 0, SAMP_W, SAMP_H).data;
+    const n = SAMP_W * SAMP_H;
+    const lum = new Uint8Array(n);
+    let sum = 0;
+    for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+      const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      lum[p] = y;
+      sum += y;
+    }
+    let bin = "";
+    for (let p = 0; p < n; p++) bin += String.fromCharCode(lum[p]);
+    return { mean: Math.round((sum / n) * 10) / 10, thumb: btoa(bin) };
+  } catch (e) {
+    return null;
   }
 }
 
@@ -591,6 +810,9 @@ async function collectStats() {
    也拿不到，只能让页面自己把 getStats() 摘要送回服务器，事后慢慢分析。 */
 async function postDiag() {
   if (!lastStats || !pc) return;
+  // 采一次就够，均值和缩略图出自同一帧 —— 分两次 drawImage 的话两者可能
+  // 来自不同的帧，跨切换比对时就会多出一份对不上的抖动。
+  const samp = sampleFrame();
   try {
     await fetch("./diag", {
       method: "POST",
@@ -601,6 +823,20 @@ async function postDiag() {
         ts: Date.now() / 1000,
         connectionState: pc.connectionState,
         iceConnectionState: pc.iceConnectionState,
+        // 摄像头这一组：current 是**板子**说的当前源（页面只是转述，不自己记），
+        // meanY 是画面亮度均值，thumb 是 32×18 的亮度缩略图（base64），
+        // gapMaxMs 是建会话以来最长的两帧间隔，
+        // gapSinceSwitchMs 是最近一次切换造成的停顿。后两个都按帧记账，
+        // 没有 1 秒采样地板。
+        camera: {
+          current: currentCam,
+          count: cams.length,
+          meanY: samp ? samp.mean : null,
+          thumb: samp ? samp.thumb : null,
+          gapMaxMs: frameGap.max ? Math.round(frameGap.max) : null,
+          gapSinceSwitchMs: stallMs(),
+          framesSeen: frameGap.n,
+        },
         ...lastStats,
       }),
     });
@@ -763,7 +999,19 @@ if (!window.isSecureContext) {
   log("注意：当前不是安全上下文（" + location.protocol + "），浏览器不会给麦克风，"
       + "对讲用不了。用板子的 https 地址打开就有。视频不受影响。");
 }
+// 和 connect() 并列，**不挂进 resolveRoom()** —— 那个函数在 URL 带 ?room=
+// 时会提前 return，把按钮的加载绑上去就等于"加了 ?room= 按钮就没了"。
+// 也不 await：清单晚一点到不影响看画面。
+loadCameras();
 connect();
+
+/* 之后每 2 秒再问一次，因为**当前是哪一路以板子为准**（见上面 currentCam 的
+   注释），而板子那边的源可能不是这个页面切的 —— 比如 tools/check_switch.sh
+   直接用 curl 发 POST。不轮询的话按钮会一直停在旧的高亮上，页面就成了
+   "自己记着"而不是"听板子的"。
+   轮询也顺手让 present 保持新鲜：摄像头拔了按钮就置灰。
+   quiet=true：没变化时不往日志区刷，否则 2 秒一条会把它淹掉。 */
+setInterval(() => { loadCameras(true); }, 2000);
 </script>
 </body>
 </html>
