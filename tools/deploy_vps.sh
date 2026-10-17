@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在公网 VPS 上部署信令服务器 + coturn(STUN/TURN)。
+# 在公网 VPS 上部署**信令服务器 + coturn(STUN/TURN)**。
 #
 # 用法（在 VPS 上，先把本目录传上去）:
 #     sudo bash deploy_vps.sh
@@ -8,9 +8,14 @@
 #   1. 探测内网/公网 IP
 #   2. 装 coturn + python3-aiohttp
 #   3. 生成 TURN 密钥 / 房间名 / token（已存在则复用，不覆盖）
-#   4. 写 /etc/turnserver.conf、/etc/webrtc-signal.env、两个 systemd unit
+#   4. 写 /etc/turnserver.conf、/etc/webrtc-signal.env、webrtc-signal.service
 #   5. 起服务并自检
 #   6. 打印安全组要放行的端口
+#
+# 目录/端口（2026-10-17 统一后）:
+#   /opt/webrtc-signal/signal_server.py   唯一信令源码（本仓库 src/signal_server.py）
+#   127.0.0.1:8443                        只监听回环；外网入口是 nginx 443
+#   观看页和 nginx 路由不在这里装 —— 在开发机上跑 tools/deploy_web_vps.sh。
 #
 # turnserver.conf 由本脚本生成而不是单独放一份模板文件：公网 IP、内网 IP 都靠探测，
 # 单独放模板会变成两份会互相漂移的"真相"。
@@ -18,16 +23,13 @@ set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "请用 root 跑：sudo bash deploy_vps.sh" >&2; exit 1; }
 
-# 本脚本在 tools/ 下，所以仓库根是它的上一级。部署时把三个目录里的文件**平铺**
-# 进 $DEST：运行时靠 signal_server.py 里的 web_dir()/media_dirs() 回退查找，
-# 平铺和仓库两种布局都能跑。
+# 本脚本在 tools/ 下，所以仓库根是它的上一级。
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_SRC="$SRC/src"
-WEB_SRC="$SRC/web"
-MEDIA_SRC="$SRC/media"
 DEST=/opt/webrtc-signal
 ENV_FILE=/etc/webrtc-signal.env
-SIGNAL_PORT="${SIGNAL_PORT:-8443}"
+# 统一端口。nginx 的 snippet 也按 8443 生成；改这里要同步改 deploy_web_vps.sh。
+SIGNAL_PORT=8443
 
 # ---- 凭证：已存在就复用。
 # 每次重跑都重新生成的话，会把已经连着的推流端和正在用的 TURN 凭证一起作废，
@@ -38,10 +40,12 @@ if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
 fi
 PUBLIC_IP="${PUBLIC_IP:-}"
-SIGNAL_PORT="${SIGNAL_PORT:-8443}"
 TURN_SECRET="${TURN_SECRET:-}"
 ROOM="${ROOM:-}"
 TOKEN="${TOKEN:-}"
+# 统一端口；不要让 env 里的历史 SIGNAL_PORT 覆盖它 ——
+# nginx 的 snippet 也按 8443 生成，两边必须一致。
+SIGNAL_PORT=8443
 
 # 先装依赖再探测 IP：探测公网 IP 要用 curl，而 curl 不保证预装。
 # 反过来的话，干净镜像上会以"探测不到公网 IP"这种极具误导性的方式失败。
@@ -152,28 +156,15 @@ fi
 echo "==> 部署信令服务器到 $DEST"
 mkdir -p "$DEST"
 install -m 644 "$PY_SRC/signal_server.py" "$DEST/signal_server.py"
-install -m 644 "$WEB_SRC/viewer.html"      "$DEST/viewer.html"
-install -m 644 "$WEB_SRC/call.html"        "$DEST/call.html"
-
-# 通话页面的"摄像头"就是这些 mp4：页面从 /media.json 拉列表，往这个目录里
-# 丢新文件就自动出现在下拉框里。没有 mp4 不算部署失败（广播模式的 viewer.html
-# 不依赖它们），但页面会明确提示"目录里没有 mp4"。
-# 用 compgen 而不是 ls *.mp4：通配符没匹配到时 ls 返回非 0，配合 set -e 会直接
-# 让整个部署脚本在这里静默中止，而且是在文件已经装了一半之后。
-if compgen -G "$MEDIA_SRC/*.mp4" >/dev/null; then
-    installed=$(ls -1 "$MEDIA_SRC"/*.mp4 | wc -l)
-    install -m 644 "$MEDIA_SRC"/*.mp4 "$DEST/"
-    echo "  已装入 $installed 个 mp4 作为通话片源"
-else
-    echo "  !! media/ 里没有 mp4，通话页面的片源下拉框会是空的"
-    echo "     先跑 tools/make_test_video.sh 生成两个测试片"
-fi
 
 id -u webrtc >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin webrtc
 
+# 只监听回环：外网唯一入口是 nginx 443（由 deploy_web_vps.sh 配置）。
+# --ice-mode turn 必须显式给：这个版本的默认是 none（局域网形态），
+# 不写的话 /ice.json 里没有 TURN，跨网观看必然连不上。
 cat > /etc/systemd/system/webrtc-signal.service <<EOF
 [Unit]
-Description=WebRTC signaling server
+Description=WebRTC signaling server (remote-monitor)
 After=network-online.target
 Wants=network-online.target
 
@@ -182,9 +173,9 @@ Type=simple
 EnvironmentFile=$ENV_FILE
 WorkingDirectory=$DEST
 ExecStart=/usr/bin/python3 $DEST/signal_server.py \\
-    --host 0.0.0.0 --port \${SIGNAL_PORT} \\
+    --host 127.0.0.1 --port $SIGNAL_PORT \\
     --public-ip \${PUBLIC_IP} --turn-secret \${TURN_SECRET} \\
-    --room \${ROOM} --token \${TOKEN}
+    --ice-mode turn --room \${ROOM} --token \${TOKEN}
 Restart=always
 RestartSec=3
 User=webrtc
@@ -229,20 +220,12 @@ check "coturn 加载的是最新配置"         "cfg_age_check coturn /etc/turns
 check "信令服务加载的是最新配置"        "cfg_age_check webrtc-signal /etc/systemd/system/webrtc-signal.service"
 check "信令服务器正在运行"               "systemctl is-active --quiet webrtc-signal"
 check "UDP 3478 在监听"                 "ss -lun | grep -q ':3478'"
-check "TCP $SIGNAL_PORT 在监听"         "ss -ltn | grep -q ':$SIGNAL_PORT'"
+check "信令 $SIGNAL_PORT 只监听回环"     "ss -ltn | grep -q '127.0.0.1:$SIGNAL_PORT'"
+check "信令没有暴露到 0.0.0.0"           "! ss -ltn | grep -q '0.0.0.0:$SIGNAL_PORT'"
 check "/healthz 有响应"                 "curl -sf --max-time 3 http://127.0.0.1:$SIGNAL_PORT/healthz"
 check "/ice.json 有响应"                "curl -sf --max-time 3 http://127.0.0.1:$SIGNAL_PORT/ice.json"
+check "/ice.json 带 TURN 凭证"           "curl -sf --max-time 3 http://127.0.0.1:$SIGNAL_PORT/ice.json | grep -q turn"
 check "turnserver.conf 没写已废弃选项"  "! grep -q '^no-loopback-peers' /etc/turnserver.conf"
-# 通话模式这一套是新增路径，装漏一个文件在浏览器里表现为"点了没反应"，
-# 在这里用一个 curl 就能拦住。
-check "/call 返回通话页面"              "curl -sf --max-time 3 http://127.0.0.1:$SIGNAL_PORT/call | grep -q '双人通话'"
-check "/media.json 有响应"              "curl -sf --max-time 3 http://127.0.0.1:$SIGNAL_PORT/media.json"
-check "片源目录非空"                    "[ -n \"\$(ls -1 $DEST/*.mp4 2>/dev/null)\" ]"
-# mp4 必须支持 Range：<video loop> 靠 206 续播，返回 200 的话第二圈就播不动了，
-# 表现是"两端的画面各卡在某一帧"，很难一眼看出是服务器的问题。
-check "mp4 支持 Range(206)"             "curl -sf -o /dev/null -r 0-99 -w '%{http_code}' \
-                                             http://127.0.0.1:$SIGNAL_PORT/media/\$(ls -1 $DEST/*.mp4 | head -1 | xargs basename) \
-                                             | grep -q 206"
 
 echo
 if [ "$fail" -ne 0 ]; then
@@ -255,29 +238,22 @@ fi
 cat <<EOF
 ------------------------------------------------------------
   腾讯云安全组需要放行（和主机防火墙两层都要放）:
-    TCP  $SIGNAL_PORT          信令 + viewer.html
+    TCP  443                 nginx（外网唯一入口，信令+页面都走这里）
     UDP  3478                STUN / TURN
     TCP  3478                TURN over TCP（兜底）
     UDP  49160-49200         relay 中继端口（与 min/max-port 一致）
     TCP  22                  SSH
 
-  然后:
-    观看页面   http://$PUBLIC_IP:$SIGNAL_PORT/?room=$ROOM
-    推流端     python3 src/webrtc_sender.py --signal ws://$PUBLIC_IP:$SIGNAL_PORT/ws/publish \\
-                   --room $ROOM --token $TOKEN
+  注意：$SIGNAL_PORT 现在只监听 127.0.0.1，不需要对外放行。
 
-  两端视频通话（两台电脑各开一个浏览器，房间名填一样的）:
-    http://$PUBLIC_IP:$SIGNAL_PORT/call?room=<自己起个房间名>
-    - 房间名不鉴权，知道名字就能进（只有 2 人上限兜底），建议用随机串
-    - "我要发"下拉框里选各自的 mp4；占位 ?src=test_video_1.mp4 可直接指定
-    - 发码率默认 800kbps（公网够用，代价是降到 480x270）；
-      局域网直连时加 &bitrate=3000000 换回清晰度
-    - 加 &relay=1 强制走 TURN；看 /call/diag?room=<房间名> 读两端回传的
-      getStats 样本（判据用 nominated=true 和 bytesReceived>0，
-      不要用 iceConnectionState —— 它在零媒体时照样是 connected）
+  下一步（在开发机上）:
+    bash tools/deploy_web_vps.sh
+    # 装观看页 + nginx 443 路由；之后：
+    #   外网观看   https://$PUBLIC_IP/webrtc
+    #   推流端     wss://$PUBLIC_IP/ws/publish（房间 $ROOM）
 
   验证 TURN 真的生效（**必须在另一台机器上跑**，在 VPS 本机测不出 NAT 问题）:
-    read -r U W < <(curl -s http://$PUBLIC_IP:$SIGNAL_PORT/ice.json | python3 -c \\
+    read -r U W < <(curl -s http://127.0.0.1:$SIGNAL_PORT/ice.json | python3 -c \\
       "import json,sys; t=[s for s in json.load(sys.stdin)['iceServers'] if 'username' in s][0]; print(t['username'], t['credential'])")
     python3 tools/turn_check.py $PUBLIC_IP "\$U" "\$W" 3478
     - 中继地址必须是 $PUBLIC_IP，是 10.x 就说明 external-ip 没生效
