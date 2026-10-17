@@ -40,11 +40,15 @@ if [ -f .env ]; then . ./.env; fi
 : "${ROOM:?没设 ROOM —— cp .env.example .env 填上，或 export ROOM=...}"
 : "${TOKEN:?没设 TOKEN —— cp .env.example .env 填上，或 export TOKEN=...}"
 : "${SIGNAL_HOST:?没设 SIGNAL_HOST —— 信令服务器主机名，见 .env.example}"
+# 取 /ice.json（TURN 配置）和 POST /diag（字节守恒遥测）时用；推流那条
+# WebSocket 仍然只认 TOKEN，不要混用。
+: "${SIGNAL_AUTH:?没设 SIGNAL_AUTH（user:pass）—— 见 .env.example}"
 
 exec python3 src/device_agent.py \
   --signal "wss://$SIGNAL_HOST/ws/publish" \
   --room "$ROOM" \
   --token "$TOKEN" \
+  --signal-auth "$SIGNAL_AUTH" \
   --tls-ca vps-self.crt \
   --camera-wb auto \
   "$@"

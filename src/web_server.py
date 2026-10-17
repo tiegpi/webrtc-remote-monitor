@@ -52,6 +52,15 @@ HERE = Path(__file__).resolve().parent
 # 所以页面代码不需要知道信令服务器到底在哪 —— 同源即可。
 PROXY_PATHS = ("/ice.json", "/diag", "/diag/clear")
 
+# 静态兜底路由只放这些后缀。VPS 上是**平铺**部署，web_server.py 和 monitor.html
+# 在同一个目录里 —— 不设白名单的话，`GET /web_server.py` 会把源码原样吐出去
+# （实测 200）。这里刻意不包含 .py / .pem / .key / .crt / .sock。
+STATIC_SUFFIXES = frozenset({
+    ".html", ".css", ".js", ".mjs",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".woff", ".woff2", ".ttf", ".map",
+})
+
 
 def agent_socket_path(args):
     """device_agent 的本地控制端点在哪。
@@ -80,13 +89,39 @@ def make_ssl_context(args):
 
 
 def web_dir(args):
+    """monitor.html 所在目录。
+
+    仓库布局是 src/ + web/ 分开的；VPS 上是**平铺**部署
+    （web_server.py 和 monitor.html 在同一个目录）。两种都要能跑：
+    脚本旁边有 monitor.html 就用脚本目录，否则按 --web-dir 相对项目根解析。
+    和 signal_server.py 里的 web_dir() 是同一个约定，部署脚本不用再传绝对路径。
+    """
     d = Path(args.web_dir)
-    return d if d.is_absolute() else (HERE.parent / d).resolve()
+    if d.is_absolute():
+        return d
+    return HERE if (HERE / "monitor.html").is_file() else (HERE.parent / d).resolve()
 
 
 def signal_ws_base(args):
     """https://host → wss://host"""
     return args.signal.replace("https://", "wss://").replace("http://", "ws://")
+
+
+def signal_auth(args):
+    """中转去 VPS 时用的 HTTP Basic Auth。
+
+    板子上的 web_server 是浏览器和 VPS 之间的可信中转：浏览器在局域网里
+    不需要登录板子，但板子替它去取 `/ice.json`、`/diag`、连 `/ws/view`
+    时，VPS 那一侧要求 Basic Auth。凭证只放在板子的 .env 里，不下发给
+    局域网浏览器。
+
+    VPS 上的 web_server 代理的是 `127.0.0.1:8443`，那一跳没有 auth_basic
+    （鉴权在 nginx），所以它不传 --signal-auth，这里返回 None。
+    """
+    if not args.signal_auth:
+        return None
+    user, _, password = args.signal_auth.partition(":")
+    return aiohttp.BasicAuth(user, password)
 
 
 def guess_local_ip():
@@ -129,6 +164,9 @@ async def handle_static(request):
     if root not in target.parents and target != root:
         raise web.HTTPForbidden()
     if not target.is_file():
+        raise web.HTTPNotFound()
+    # 平铺部署时 web_server.py 就在这个目录里，白名单是必须的。
+    if target.suffix.lower() not in STATIC_SUFFIXES:
         raise web.HTTPNotFound()
     return web.FileResponse(target)
 
@@ -184,7 +222,8 @@ async def handle_proxy(request):
 
     try:
         async with request.app["session"].request(
-            request.method, url, data=body or None, headers=headers
+            request.method, url, data=body or None, headers=headers,
+            auth=signal_auth(args),
         ) as r:
             payload = await r.read()
             return web.Response(
@@ -214,7 +253,8 @@ async def handle_ws_view(request):
     await client.prepare(request)
 
     try:
-        upstream = await request.app["session"].ws_connect(target, heartbeat=30)
+        upstream = await request.app["session"].ws_connect(
+            target, heartbeat=30, auth=signal_auth(args))
     except Exception as exc:  # noqa: BLE001
         log.error("连不上信令服务器 %s: %s", target, exc)
         await client.close(code=1011, message=b"signal server unreachable")
@@ -335,6 +375,9 @@ def parse_args(argv=None):
     p.add_argument("--web-dir", default="web", help="页面目录（相对项目根）")
     p.add_argument("--signal", default="https://124.223.11.112",
                    help="信令服务器根地址。信令相关请求都转到这里")
+    p.add_argument("--signal-auth", default=None, metavar="USER:PASS",
+                   help="转发到 VPS 时用的 HTTP Basic Auth。板子中转必须给；"
+                        "VPS 本机代理 127.0.0.1:8443 时不需要")
     p.add_argument("--room", default=None,
                    help="房间号，会通过 /config.json 告诉页面。"
                         "**必须和 device_agent.py 的 --room 一致**："

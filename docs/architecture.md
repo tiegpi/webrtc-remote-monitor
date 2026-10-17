@@ -36,29 +36,90 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 几个看起来该在服务器的职责其实在板子上。
 
 ```
-        ┌─ 公网 VPS（124.223.11.112）──────────────┐
-        │  signal_server.py   只有这一个职责：撮合    │
-        │  coturn             STUN/TURN（兜底）      │
-        └───────────────────────────────────────────┘
-                    ▲                    ▲
-             wss /ws/publish      wss /ws/view
-                    │                    │
-        ┌─ 板子（192.168.2.187）────┐    │
-        │  device_agent.py  ←───────┼────┘  （主动连出去）
-        │  web_server.py    ←───────┘
-        │      ▲                    │
-        └──────┼────────────────────┘
-               │ http / ws（同源）
-           浏览器 ───── RTP 直连 ─────> 板子
+        ┌─ 公网 VPS（124.223.11.112）────────────────────────┐
+        │  nginx :443         外网唯一入口（TLS，自签证书）     │
+        │    /ws/publish          → 127.0.0.1:8443（token）  │
+        │    /ws/view /diag /ice.json → 8443（Basic Auth）   │
+        │    /webrtc /config.json /camera → 8444（Basic Auth）│
+        │    /                    → 404（不暴露入口）         │
+        │  signal_server.py :8443  撮合（只监听回环）          │
+        │  web_server.py    :8444  外网观看页（只监听回环）     │
+        │  coturn  :3478          STUN/TURN（兜底）           │
+        └────────────────────────────────────────────────────┘
+                  ▲                    ▲                 ▲
+           wss /ws/publish      wss /ws/view       https://124.223.11.112/webrtc
+                  │                    │                 │
+        ┌─ 板子（192.168.2.187）────┐ │                 │
+        │  device_agent.py  ←───────┼─┘  主动连出去       │
+        │  web_server.py    ←───────┘                    │
+        │      ▲                                          │
+        └──────┼──────────────────────────────────────────┘
+               │ http / ws（同源，局域网）     外网浏览器 ──┘
+           局域网浏览器 ─── RTP 直连 ───> 板子
+           外网浏览器   ─── RTP（直连或 TURN 中继）───> 板子
 ```
 
-三条通路要分开看，它们的路径完全不同：
+两条观看入口**并存**，页面是同一份 `monitor.html`：
+
+| 入口 | 页面来源 | 适合 | 鉴权 |
+|---|---|---|---|
+| `https://<板子IP>:8443/` | 板子的 `web_server.py` | 局域网，不依赖 VPS 也能看 | 无（局域网） |
+| `https://124.223.11.112/webrtc` | VPS 的 `web_server.py`（nginx 之后） | 外网 / 跨网 | HTTP Basic Auth |
+
+信令在两种情况下都走 VPS 的 8443；媒体始终是浏览器与板子之间的 ICE 路径，
+**不经过任何一个 `web_server.py`**。
+
+### 外网访问控制
+
+VPS 的 IP 是公开的，"路径不好猜"不构成权限。因此 nginx 在 443 上对**所有观看
+相关路径**要求 HTTP Basic Auth（htpasswd 在 `/etc/nginx/webrtc-view.htpasswd`）：
+
+- 受保护：`/webrtc`、`/monitor.html`、`/config.json`（房间号）、`/ice.json`
+  （TURN 凭证）、`/diag`、`/diag/clear`、`/camera`、`/ws/view`
+- **不受保护**：`/ws/publish`。推流端只认 `signal_server.py` 的 token；不套
+  Basic Auth 是刻意的——观看密码和推流凭证分开，改密码不会打断推流。
+- 根路径 `/` 直接 404，不再 302；其他未列出的路径也一律 404。
+- `/webrtc/` 仍 301 回 `/webrtc`（nginx 的 `return` 在鉴权之前执行，但它只回一个
+  Location，目标仍然要登录）。
+
+浏览器登录页面后会把凭证缓存到该 origin，同源的 `fetch` 和 WebSocket 握手都会
+自动带上，页面代码不需要改。实测（CDP 驱动 Chrome，走真实 401 挑战）：
+页面、`/config.json`、`/ice.json`、`/ws/view` 全部通过，视频正常出帧。
+
+凭证由 `tools/deploy_web_vps.sh` 首次随机生成，之后复用；明文只存在
+`/root/webrtc-view.credentials`（600），htpasswd 是 apr1 哈希（640 root:www-data）。
+
+**换密码用 `tools/set_view_password.sh`**（推荐，不重部署、不打断推流）：
+
+```bash
+bash tools/set_view_password.sh '新密码'        # 用户名默认 viewer
+VIEW_USER=gtie bash tools/set_view_password.sh '新密码'
+```
+
+它一次做完四件事：VPS htpasswd + 明文凭证文件 + `nginx -t`/reload、板子 `.env`
+的 `SIGNAL_AUTH`、重启板子两个进程，最后自检「未登录 401 / 登录 200 / 板子
+`/ice.json` 有 TURN / agent 日志拿到 ICE 配置」。密码限制为
+`[A-Za-z0-9._-]`（板子 `.env` 会被 bash source，其他字符会弄坏它）。
+也可以走完整部署：`VIEW_PASS='新密码' bash tools/deploy_web_vps.sh`，但它会重启
+信令服务，而且**不会自动改板子**。
+
+**板子侧也要带凭证**：局域网的 `web_server.py` 会替浏览器去 VPS 取
+`/ice.json`、`/diag`，并代理 `/ws/view`；`device_agent.py` 也会取
+`/ice.json` 和 POST `/diag`。这两条上游请求现在都在 auth_basic 后面，所以板子
+`.env` 里必须有 `SIGNAL_AUTH=user:pass`，由 `tools/run-web.sh` /
+`tools/run-agent.sh` 传成 `--signal-auth`。局域网浏览器本身不需要登录板子；
+凭证只在板子和 VPS 之间使用。推流 WebSocket 仍然只认 `TOKEN`，不要给它加
+Basic Auth。
+
+几条通路要分开看，它们的路径完全不同：
 
 | 通路 | 路径 | 说明 |
 |---|---|---|
 | **媒体（RTP）** | 浏览器 ⇄ 板子，**直连** | ICE 选出来的路径。局域网时就是 host candidate 直连；跨网时走 TURN 中继，那时候 RTP 才经过 VPS |
-| **信令** | 浏览器 ⇄ 板子 ⇄ VPS | 板子只做透传。**浏览器从不直连 VPS** |
-| **控制**（切摄像头） | 浏览器 ⇄ 板子（本地 unix socket） | **不经过 VPS**，见第五节 |
+| **信令（局域网页）** | 浏览器 ⇄ 板子 ⇄ VPS | 板子只做透传。浏览器不直连 VPS，省掉在浏览器里接受自签证书 |
+| **信令（外网页）** | 浏览器 ⇄ VPS（443 → 8443） | 页面本身就来自 VPS，同源；由 nginx 终结 TLS |
+| **控制（局域网页）** | 浏览器 ⇄ 板子（本地 unix socket） | **不经过 VPS**，见第五节 |
+| **控制（外网页）** | — | VPS 上没有 `device_agent` 的 unix socket，`/camera` 明确返回 502，页面不显示切换按钮 |
 
 ### 为什么信令要绕板子一手
 
@@ -70,13 +131,30 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 板子一个来源。阶段二给板子加 HTTPS 时，也只需要接受板子一张证书，
 **安全上下文和信令一并解决**，不用在两台机器上各点一次。
 
-### 为什么页面由板子提供，而不是 VPS
+### 为什么两边各放一份页面服务
 
-用户定的形态。代价和收益：
+最初只有板子提供页面；外网观看的需求出现后，VPS 上也放了同一份
+`web_server.py`（`tools/deploy_web_vps.sh` 部署到 `/opt/webrtc-web-server`，
+**平铺**放 `web_server.py` + `monitor.html`，不再有 `src/`、`web/` 子目录）。
+平铺后静态兜底路由只放行 html/css/js/图片/字体后缀，`GET /web_server.py` 明确 404 ——
+否则源码会被当成静态文件原样下载（实测踩过）。部署自检里有一条专门卡这个。
+两份页面服务互不依赖：
 
-- 收益：局域网内不依赖 VPS 就能看（VPS 挂了照样能看画面、能切摄像头）；
-  页面和它要调的控制通道天然同源。
-- 代价：板子上多一个常驻 HTTP 服务（`web_server.py`），并且要给它签证书。
+VPS 上的信令只有**一个**实例：`/opt/webrtc-signal/signal_server.py`，源码就是本仓库的
+`src/signal_server.py`，监听 `127.0.0.1:8443`。早期 camera-pipeline 那版 8443 实例
+（带 `/call`、没有 `/diag`）已经退掉；为了绕开它而临时起的 `9443` 也一并消失。
+
+- **局域网入口**：页面和切摄像头的控制通道天然同源；VPS 挂了照样能看画面、
+  能切摄像头。
+- **外网入口**：页面来自 VPS，同样的同源关系；TLS 由 nginx 在 443 终结，
+  浏览器需要接受一次 VPS 的自签证书，再过一次 Basic Auth。`web_server.py`
+  自己只监听回环（`127.0.0.1:8444`），WAN 上没有多暴露一个端口。
+- **同一个房间**：两个入口都指向信令服务器上同一个 `ROOM`。板子同时只接受
+  一个观看端，所以局域网和外网**不能同时看**，后接入的那一路会被明确拒绝。
+  要并行得给信令服务器加多观看端支持，超出当前的遥操作场景。
+
+为什么不干脆让 VPS 反向代理板子的页面：板子在 NAT 后面，VPS 根本够不着它。
+外网观看能成立的前提正是板子主动连出去（推流）和 TURN 兜底（媒体）。
 
 ---
 
@@ -101,6 +179,7 @@ web/
 tools/
   run-agent.sh run-web.sh     起服务
   gen_cert.sh deploy_vps.sh   证书 / 部署
+  deploy_web_vps.sh           VPS 上的观看页服务 + nginx 路由
   analyze_diag.py             **主验收**：13 条（视频）或 17 条（含音频）判据
   check_switch.sh             切换摄像头那组 13 条判据
   check_fd.sh                 会话拆除后设备 fd 有没有还回去
@@ -199,6 +278,17 @@ VPS 挂了就换不了摄像头 —— 而板子就在隔壁。
 3. 列表是动态的（设备可能没插），和语义为"静态"的 config 不是一类东西。
 
 所以列表走单独的 `GET /camera`。
+
+### 外网页面没有切摄像头
+
+VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 unix socket，
+所以 `/camera` 会明确返回 502（页面日志里会说"取摄像头列表失败"，因此不渲染
+切换按钮）。视频和语音完全不受影响。
+
+要让外网也能切，得让板子主动开一条**反向 unix socket 隧道**到 VPS，
+例如 `ssh -R /run/webrtc-web/agent.sock:<板子上的 agent.sock> ...`，
+再把 VPS 上 web_server 的 `--agent-socket` 指过去。这和"板子零入站端口"的
+原则一致，但它引入一条新的长期 SSH 信任链，所以没有默认做。
 
 ---
 
@@ -361,12 +451,36 @@ https://<板子IP>:8443/?room=<房间>
 
 ### 公网（当前部署形态）
 
-VPS 上：`sudo bash tools/deploy_vps.sh` 装信令服务器 + coturn，
-生成 `/etc/webrtc-signal.env`（房间号、token、TURN 密钥）和两个 systemd unit。
+VPS 上：`sudo bash tools/deploy_vps.sh` 装 coturn，并生成
+`/etc/webrtc-signal.env`（房间号、token、TURN 密钥）。
 
-板子上：`tools/run-agent.sh --signal wss://<VPS>/ws/publish --room <房间> --token <token> --tls-ca vps-self.crt`
+再在开发机上跑 `bash tools/deploy_web_vps.sh`。它把 VPS 收敛成两个目录：
 
-浏览器打开 `https://<板子>:8443/?room=<房间>`。
+- `/opt/webrtc-signal`：**唯一**的信令服务，源码就是本仓库的
+  `src/signal_server.py`，监听 `127.0.0.1:8443`
+- `/opt/webrtc-web-server`：观看页服务，**平铺**放 `web_server.py` + `monitor.html`，
+  监听 `127.0.0.1:8444`
+
+并配置 nginx 的 443 分派与观看端 Basic Auth（详见第二节"外网访问控制"）。
+旧副本目录 `/opt/webrtc-signal-next`、`/opt/webrtc-signal-monitor`、
+`/opt/webrtc_web_server` 会被清掉；旧的 8443 unit 和源码会备份到
+`/root/webrtc-consolidation-backup-*`。
+
+注意：统一后的信令源码**没有** camera-pipeline 版的 `/call`、`/media`、`/ws/call`，
+那套双人通话演示不再由这台 VPS 的 8443 提供；要恢复得回 camera-pipeline 项目单独部署。
+
+板子上：填好 `.env`（`ROOM`、`TOKEN`、`SIGNAL_HOST`、`SIGNAL_AUTH`）后跑
+`tools/run-agent.sh`，同时跑 `tools/run-web.sh` 提供局域网观看页。两个脚本都从
+`.env` 读，`SIGNAL_AUTH` 必须和 VPS 上部署脚本打印的那组观看端凭证一致 ——
+板子替浏览器访问 VPS 的 `/ice.json`、`/diag`、`/ws/view` 时要带上它。
+直接传命令行参数也可以，但 `.env` 是唯一推荐方式（两边不会写岔）。
+
+浏览器：
+
+- 局域网：`https://<板子>:8443/?room=<房间>`
+- 外网：`https://<VPS>/webrtc`，**需要登录**（用户名/密码见部署脚本输出，或
+  `/root/webrtc-view.credentials`）。房间号由 `/config.json` 自动给出，不用手写。
+  根路径 `/` 返回 404，不再跳转；`/webrtc/` 会 301 回 `/webrtc`。
 
 ### 关键参数
 

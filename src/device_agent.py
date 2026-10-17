@@ -84,6 +84,23 @@ def make_ssl_context(args):
     return ctx
 
 
+def signal_auth(args):
+    """板子访问 VPS 的 HTTP 端点时用的 HTTP Basic Auth。
+
+    `/ice.json`（TURN 凭证）和 `/diag`（字节守恒遥测）现在都在 nginx 的
+    auth_basic 后面。板子是最初的可信中转，得用自己的凭证过这一层 ——
+    否则它取不到 TURN 配置、遥测也传不上去，而症状是"画面能看、但字节守恒
+    那条判据一直说没拿到设备侧样本"，很容易误判成遥测线程挂了。
+
+    **推流 WebSocket（/ws/publish）不要套这个**：那条路是自己的 `--token`，
+    而 GStreamer/aiohttp 的 401 交互和 token 是两回事，混在一起只会更难查。
+    """
+    if not args.signal_auth:
+        return None
+    user, _, password = args.signal_auth.partition(":")
+    return aiohttp.BasicAuth(user, password)
+
+
 def quiet_ws_reset(loop):
     """别让 aiohttp 心跳任务在对端消失后抛的 ConnectionResetError 刷满日志。
 
@@ -298,7 +315,8 @@ async def telemetry_loop(http, args, get_session, base_url, interval=1.0):
                 "role": "device",
                 "room": args.room,
                 **session.counters(),
-            }, timeout=aiohttp.ClientTimeout(total=3))
+            }, timeout=aiohttp.ClientTimeout(total=3),
+               auth=signal_auth(args))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -356,7 +374,7 @@ async def publish_once(args, state, url, ice_url):
                                 "message": "本设备同时只接受一个观看端",
                             })
                             continue
-                        ice = await fetch_ice(http, ice_url)
+                        ice = await fetch_ice(http, ice_url, args)
                         ice.setdefault("stun", "")
                         ice.setdefault("turn", "")
                         ice["stun"] = ice["stun"] or args.stun
@@ -468,12 +486,13 @@ class WsSender:
                 self.broken = True
 
 
-async def fetch_ice(http, ice_url):
+async def fetch_ice(http, ice_url, args):
     """从信令服务器取 STUN/TURN 配置。取不到就用命令行参数兜底。"""
     if not ice_url:
         return {}
     try:
-        async with http.get(ice_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+        async with http.get(ice_url, timeout=aiohttp.ClientTimeout(total=5),
+                            auth=signal_auth(args)) as r:
             cfg = await r.json()
         return {
             "stun": cfg.get("stunUriForGst", ""),
@@ -562,6 +581,9 @@ def parse_args(argv=None):
     g.add_argument("--token", default="demo", help="推流端 token")
     g.add_argument("--ice-url", default=None,
                    help="STUN/TURN 配置地址，默认取信令服务器同源的 /ice.json")
+    g.add_argument("--signal-auth", default=None, metavar="USER:PASS",
+                   help="访问 VPS 的 /ice.json、/diag 用的 HTTP Basic Auth。"
+                        "**只用于 HTTP 端点**；/ws/publish 仍然只认 --token")
     g.add_argument("--tls-ca", default=None,
                    help="wss:// 且服务器用自签证书时，把那张证书的路径给它")
     g.add_argument("--stun", default="", help="直接指定 STUN，覆盖服务器下发的")

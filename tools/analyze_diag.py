@@ -18,6 +18,8 @@ analyze_diag.py —— 判据检查器
 
 用法：
     python3 tools/analyze_diag.py --url http://127.0.0.1:8080 --room demo
+    python3 tools/analyze_diag.py --url https://124.223.11.112 \
+        --auth viewer:密码 --insecure --room 70ef7d99
     python3 tools/analyze_diag.py --file samples.json
 """
 
@@ -57,7 +59,24 @@ def ssl_context(args):
     return None
 
 
-def fetch(url, ctx=None):
+def fetch(url, ctx=None, auth=None):
+    """读 /diag。
+
+    VPS 上的外网入口（/webrtc 那一套）现在要求 HTTP Basic Auth，直接
+    urlopen 会拿到 401 的 HTML，json 解析炸在一句和权限毫无关系的
+    "Expecting value: line 1 column 1" 上。给 --auth 时走带凭证的 opener；
+    局域网板子的 /diag 不需要，保持原样。
+    """
+    if auth:
+        user, _, password = auth.partition(":")
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        mgr.add_password(None, url, user, password)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPBasicAuthHandler(mgr),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        with opener.open(url, timeout=10) as r:
+            return json.load(r)
     with urllib.request.urlopen(url, timeout=10, context=ctx) as r:
         return json.load(r)
 
@@ -86,7 +105,8 @@ def load_samples(args):
         with open(args.file, encoding="utf-8") as f:
             data = json.load(f)
     else:
-        data = fetch(diag_url(args.url, args.room), ssl_context(args))
+        data = fetch(diag_url(args.url, args.room), ssl_context(args),
+                     args.auth)
     # 两种形状都得认：`--url` 拿到的 /diag 是 {"items": [...]}，而
     # `--file` 常常是别人自己拼的一个裸列表（比如把浏览器侧和板子侧的样本
     # 合并成一个文件）。写成 data.get("items", data if isinstance(...)) 不行 ——
@@ -547,6 +567,9 @@ def main():
                    help="信令服务器用自签证书时，把那张证书的路径给它")
     p.add_argument("--insecure", action="store_true",
                    help="跳过证书校验（仅用于临时排查，别写进脚本）")
+    p.add_argument("--auth", default=None, metavar="USER:PASS",
+                   help="HTTP Basic Auth。VPS 外网入口的 /diag 需要；"
+                        "局域网板子上的 /diag 不需要")
     p.add_argument("--warmup", type=float, default=DEFAULT_WARMUP,
                    help="丢掉开头这么多秒的启动斜坡")
     p.add_argument("--max-gap", type=float, default=5.0,

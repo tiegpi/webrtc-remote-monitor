@@ -23,6 +23,9 @@ cd "$(dirname "$0")/.."
 if [ -f .env ]; then . ./.env; fi
 : "${ROOM:?没设 ROOM —— cp .env.example .env 填上，或 export ROOM=...}"
 : "${SIGNAL_HOST:?没设 SIGNAL_HOST —— 信令服务器主机名，见 .env.example}"
+# VPS 的 /ice.json /diag /ws/view 在 nginx auth_basic 后面。局域网浏览器
+# 不用登录板子，但板子替它去 VPS 取这些东西时必须带上凭证。
+: "${SIGNAL_AUTH:?没设 SIGNAL_AUTH（user:pass）—— 见 .env.example}"
 
 PORT=8443
 
@@ -35,6 +38,7 @@ exec python3 src/web_server.py \
     --port "$PORT" \
     --room "$ROOM" \
     --signal "https://$SIGNAL_HOST" \
+    --signal-auth "$SIGNAL_AUTH" \
     --tls-ca vps-self.crt \
     --tls-cert certs/board.crt \
     --tls-key certs/board.key \
