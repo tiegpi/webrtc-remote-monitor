@@ -134,6 +134,10 @@ class AgentState:
     def __init__(self, args):
         self.args = args
         self.session = None
+        # 当前会话属于哪个观看端。信号服务器支持多个观看端并存，而本进程
+        # 只服务一个；所有 viewer-left / answer / candidate 都要拿它做匹配，
+        # 否则被拒绝的第二个观看端一离开，就会把第一个的会话拆掉。
+        self.viewer_id = None
         self.source = sources.initial(args.camera_source)
         self.lock = asyncio.Lock()      # 串行化切换，防页面连点
 
@@ -365,13 +369,25 @@ async def publish_once(args, state, url, ice_url):
                     kind = data.get("type")
 
                     if kind == "viewer-joined":
+                        vid = data.get("viewer")
+                        if not vid:
+                            log.error("服务器发的 viewer-joined 里没有 viewer 字段，"
+                                      "无法路由，跳过这次接入")
+                            continue
                         # 单观看端设计：已经有人在看就明确拒绝，
                         # 而不是默默开第二路抢同一个摄像头。
-                        if state.session is not None:
+                        # 错误消息**必须带 viewer**：信令服务器靠这个字段
+                        # 找连接（signal_server.handle_publish），缺了它消息
+                        # 会被当成"发布端发错房间"丢掉，第二个观看端就永远
+                        # 停在等待，而这边日志却写着"已拒绝"。
+                        if state.session is not None and not state.session.stopped:
                             log.warning("已有一个观看端，拒绝新的连接")
                             await sender.send({
                                 "type": "error",
-                                "message": "本设备同时只接受一个观看端",
+                                "viewer": vid,
+                                "code": "device-busy",
+                                "message": "本设备同时只接受一个观看端，"
+                                           "请等当前观看端退出后刷新页面",
                             })
                             continue
                         ice = await fetch_ice(http, ice_url, args)
@@ -381,33 +397,46 @@ async def publish_once(args, state, url, ice_url):
                         ice["turn"] = ice["turn"] or args.turn
                         ice["policy"] = args.ice_policy
 
-                        vid = data.get("viewer")
-                        if not vid:
-                            log.error("服务器发的 viewer-joined 里没有 viewer 字段，"
-                                      "无法路由，跳过这次接入")
-                            continue
                         # source 用 state 里记住的那个：没有观看端时切过摄像头
                         # 的话，新会话要按那个选择建 pipeline。
                         state.session = DeviceSession(
                             tag_viewer(sender, vid), loop, args, ice,
                             source=state.source,
                         )
+                        state.viewer_id = vid
                         try:
                             state.session.start()
                         except Exception as exc:  # noqa: BLE001
                             log.exception("建 pipeline 失败")
                             await sender.send({"type": "error", "message": str(exc)})
                             state.session = None
+                            state.viewer_id = None
                             continue
                         log.info("观看端已接入，开始推流")
 
                     elif kind == "viewer-left":
-                        if state.session is not None:
-                            state.session.stop()
-                            state.session = None
-                            log.info("观看端已离开")
+                        # 只认当前会话的那个观看端。被拒绝的第二个观看端也会
+                        # 在断开时触发 viewer-left，如果不比对 id，它会把正常
+                        # 那个会话一起停掉 —— 症状是"后连的把先连的踢下线"。
+                        left_vid = data.get("viewer")
+                        if state.session is None:
+                            continue
+                        if left_vid is not None and left_vid != state.viewer_id:
+                            log.info("观看端 %s 离开，但当前会话属于 %s，忽略",
+                                     left_vid, state.viewer_id)
+                            continue
+                        state.session.stop()
+                        state.session = None
+                        state.viewer_id = None
+                        log.info("观看端已离开")
 
                     elif kind in ("answer", "candidate"):
+                        # 同样只接受当前观看端的信令；否则被拒绝的那个如果
+                        # 乱发 answer/candidate，会污染正在跑的会话。
+                        msg_vid = data.get("viewer")
+                        if msg_vid is not None and msg_vid != state.viewer_id:
+                            log.debug("忽略非当前观看端 %s 的 %s", msg_vid, kind)
+                            continue
                         if state.session is not None:
                             state.session.on_signal(data)
 
@@ -415,6 +444,7 @@ async def publish_once(args, state, url, ice_url):
                         if state.session is not None:
                             state.session.stop()
                             state.session = None
+                            state.viewer_id = None
 
                     elif kind == "error":
                         code = data.get("code")
@@ -439,6 +469,7 @@ async def publish_once(args, state, url, ice_url):
                 if state.session is not None:
                     state.session.stop()
                     state.session = None
+                    state.viewer_id = None
     return clean
 
 

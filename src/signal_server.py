@@ -219,7 +219,18 @@ async def handle_publish(request):
     await ws.prepare(request)
 
     if room.publisher is not None:
-        return await reject("room-busy", "这个房间已经有发布端了")
+        # 这条路径在 ws.prepare() 之后，**不能**再走 reject()：reject 会新建一个
+        # WebSocketResponse 并再 prepare 一次，aiohttp 3.8 的 _post_start 会在
+        # request.protocol.set_parser() 里遇到
+        #   assert self._payload_parser is None
+        # 直接抛 AssertionError —— 错误消息发不出去，客户端只看到连接被掐断，
+        # 而板端会把它当成正常断开，退避被重置，变成每秒重试。
+        # 所以这里直接在已经 prepared 的 ws 上回错误（和 handle_view 的
+        # bad-room 路径同一个写法）。
+        await ws.send_json({"type": "error", "code": "room-busy",
+                            "message": "这个房间已经有发布端了"})
+        await ws.close()
+        return ws
 
     room.epoch += 1
     epoch = room.epoch
@@ -270,8 +281,12 @@ async def handle_publish(request):
                     "sdpMLineIndex": data.get("sdpMLineIndex", 0),
                 })
             elif kind == "error":
+                # code 必须透传：页面靠它区分"设备忙"和其它错误，只给
+                # message 的话，第二个观看端只能看到笼统的"服务器错误"。
                 await viewer.send(
-                    {"type": "error", "message": data.get("message", "发布端错误")}
+                    {"type": "error",
+                     "code": data.get("code"),
+                     "message": data.get("message", "发布端错误")}
                 )
             else:
                 log.debug("忽略发布端消息: %s", kind)
@@ -495,8 +510,12 @@ def build_ssl_context(args):
     return ctx
 
 
-async def _serve(args):
-    quiet_ws_reset(asyncio.get_running_loop())
+def build_app(args):
+    """组装 aiohttp 应用。
+
+    单独抽出来，是为了让 tools/test_signal_server.py 起**同一份**路由表，
+    而不是在测试里复制一遍 —— 复制出来的路由迟早会和真实入口分叉。
+    """
     app = web.Application()
     app["args"] = args
     app["room"] = Room(args.room)
@@ -508,6 +527,12 @@ async def _serve(args):
     app.router.add_get("/ws/view", handle_view)
     app.router.add_route("*", "/diag", handle_diag)
     app.router.add_post("/diag/clear", handle_diag_clear)
+    return app
+
+
+async def _serve(args):
+    quiet_ws_reset(asyncio.get_running_loop())
+    app = build_app(args)
 
     ssl_ctx = build_ssl_context(args)
 

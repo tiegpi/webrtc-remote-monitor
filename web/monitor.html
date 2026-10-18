@@ -126,6 +126,7 @@ let room = new URLSearchParams(location.search).get("room") || null;
 $("roomLabel").textContent = room ? "房间 " + room : "房间 …";
 
 let pc = null, ws = null, statsTimer = null, diagTimer = null;
+let reconnectBusy = false;
 let prevSample = null;        // 上一次采样，用来算码率/帧率的增量
 let iceServers = [];          // 从 /ice.json 拿到的 STUN/TURN 配置
 // 页面版本号，跟着每一份 diag 样本上报。
@@ -842,7 +843,10 @@ async function connect() {
           break;
         case "error":
           log("服务器错误: " + msg.message);
-          setStatus("服务器错误", "err");
+          // 板子只接受一个观看端。第二个连接会被明确拒绝，这里直接说清楚，
+          // 不要笼统显示"服务器错误"——用户分不清是设备忙还是服务器坏了。
+          setStatus(msg.code === "device-busy"
+                    ? "设备忙：已有观看端" : "服务器错误", "err");
           break;
         default:
           log("未知消息: " + msg.type);
@@ -1303,17 +1307,32 @@ async function startTalk() {
 /* 拆掉当前会话再连一次。
    ws.onclose 本来也会 teardownPc，但这里显式做一遍，不依赖回调时序；
    而关旧的 ws 之前先摘掉 onclose，否则它会再触发一次 setStatus("已断开")，
-   界面上闪一下"已断开"再回到"重连中"，看起来像出错了。 */
-function reconnect() {
+   界面上闪一下"已断开"再回到"重连中"，看起来像出错了。
+
+   **必须等旧连接真的 close 再建新连接**：信令服务器要在旧连接的 finally 里
+   把它从房间摘掉。新连接如果抢在前面到，板子会把它当成第二个观看端拒绝，
+   于是页面自己把自己顶下线。最多等 800ms，异常情况下不至于卡死。 */
+async function reconnect() {
+  if (reconnectBusy) return;
+  reconnectBusy = true;
   const old = ws;
   ws = null;
-  if (old) {
-    old.onclose = null;
-    try { old.close(); } catch (e) { /* 已经关了就算了 */ }
-  }
   teardownPc();
+  if (old && old.readyState !== WebSocket.CLOSED) {
+    await new Promise((resolve) => {
+      const done = () => resolve();
+      old.addEventListener("close", done, { once: true });
+      setTimeout(done, 800);
+      old.onclose = null;
+      try { old.close(); } catch (e) { done(); }
+    });
+  }
   setStatus("重连中…", "warn");
-  connect();
+  try {
+    await connect();
+  } finally {
+    reconnectBusy = false;
+  }
 }
 
 /* ---------------------------------------------------------------- 启动 */

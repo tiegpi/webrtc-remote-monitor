@@ -14,17 +14,21 @@ session.py —— 一路 WebRTC 会话：pipeline + webrtcbin + 信令
     └─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
 
 GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能在 asyncio
-线程里写。两个方向的跨越各有一处，且只有一处：
+线程里写。跨线程只允许走下面这几个入口：
 
     asyncio → GLib   on_signal() 里 emit webrtcbin 的信号，会同步派发到 GLib 线程
+                     start()/stop() 内部统一投到 GLib 线程（见 _call_on_glib）
     GLib → asyncio   _send_threadsafe() 用 run_coroutine_threadsafe 投回去
 
-不要在别的任何地方跨线程碰对方的对象。
+不要在别的任何地方跨线程碰对方的对象。生命周期方法故意做成"任意线程可调"：
+调用点包括 device_agent 的 asyncio 循环和 tools/check_offer.py，它们都不该
+各自记得 marshaling。
 """
 
 import asyncio
 import json
 import logging
+import threading
 import time
 
 import gi
@@ -47,6 +51,49 @@ log = logging.getLogger("session")
 # 统计探针要同时接这两种。理由见 _attach_counters 的说明 —— 少一个就会漏掉
 # 九成流量，而且漏得"很有规律"，看起来像正常的小流量。
 _RTP_PROBE_TYPES = Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST
+
+# 把一次同步调用投到 GLib 线程并等结果。超时只用于"GLib 循环已经死了"这种
+# 本不该发生的路径：正常启动/拆除最多几秒，30 秒足够把问题变成一条明确的
+# 异常，而不是永远卡住。
+_GLIB_CALL_TIMEOUT = 30.0
+
+
+def _on_glib_thread():
+    """当前线程是不是正在跑默认主上下文（也就是 glib-main 线程）。"""
+    return bool(GLib.MainContext.default().is_owner())
+
+
+def _call_on_glib(fn, what):
+    """在 GLib 线程执行 fn() 并返回结果；可以从任意线程调用。
+
+    已经在 GLib 线程时**直接执行**：回调里再 idle_add 然后等自己，会死锁。
+    不在时用 idle_add 投递，threading.Event 等结果；异常原样带回调用线程，
+    否则启动失败会变成"什么都没发生"，这在这块代码里是最难查的一类症状。
+    """
+    if _on_glib_thread():
+        return fn()
+
+    done = threading.Event()
+    box = {}
+
+    def on_idle():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:          # noqa: BLE001
+            box["error"] = exc
+        finally:
+            done.set()
+        return False                          # 只跑一次
+
+    GLib.idle_add(on_idle)
+    if not done.wait(_GLIB_CALL_TIMEOUT):
+        raise TimeoutError(
+            "%s 等待 GLib 线程超时（%.0f 秒）；glib-main 线程还活着吗？"
+            % (what, _GLIB_CALL_TIMEOUT)
+        )
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 class DeviceSession:
@@ -110,6 +157,10 @@ class DeviceSession:
 
     # ---------------- 生命周期 ----------------
     def start(self):
+        """启动管线。可以从任意线程调用，内部会投到 GLib 线程。"""
+        _call_on_glib(self._start_on_glib, "启动会话")
+
+    def _start_on_glib(self):
         self.pipeline, self.webrtcbin, self.switch = pipeline.build(
             self.args, self.ice, log, self.source,
             on_audio_elements=self._on_audio_elements)
@@ -149,6 +200,13 @@ class DeviceSession:
         log.info("pipeline 已启动，等待协商…")
 
     def stop(self):
+        """关闭会话。可以从任意线程调用；重复调用是安全的。"""
+        if self.stopped:
+            return
+        _call_on_glib(self._stop_on_glib, "关闭会话")
+
+    def _stop_on_glib(self):
+        # 两个线程可能同时通过上面的检查；GLib 线程内是串行的，这里再判一次。
         if self.stopped:
             return
         self.stopped = True
