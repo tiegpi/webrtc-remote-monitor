@@ -361,6 +361,102 @@ def audio_checks(add, first, last, device, args):
            d_frames / max(1e-6, last["_at"] - first["_at"])))
 
 
+def teleop_checks(add, last, device, args):
+    """阶段三：遥操作回路。
+
+    和音频那条是同一条原则 —— **页面自己记的账不算数，得和板子记的对上**。
+    页面完全可以在 DataChannel 断掉之后继续显示"已发 10、ACK 10"，只要它的
+    回执配对逻辑写错了；板子的 teleop_rx / teleop_ack / teleop_overlay 是另一份
+    独立记录，还能顺便证明"命令真的落到了画面上"（overlay 只在对上了合法命令
+    并且成功写进 textoverlay 时才涨）。
+
+    空闲是一种**合法的**状态：页面开着但没人操作。默认仍要求发过命令 ——
+    "一条都没发"不能算这条回路验过了。要接受空闲就显式给 --teleop-allow-idle。
+    """
+    t = last.get("teleop")
+    if not t:
+        add("浏览器样本带遥操作统计", False,
+            "样本里没有 teleop 字段。页面的 PAGE_VERSION 变了吗？"
+            "（旧页面不上报这一块）")
+        return
+
+    neg = last.get("negotiation") or {}
+    # 通道没打开时，这两项是唯一能把"为什么"说清楚的东西：
+    # appMedia=false → 板子的 offer 里根本没有 m=application
+    # sctpPort 空   → 有这一节但没有 a=sctp-port
+    add("板子的 offer 里有 SCTP", bool(neg.get("appMedia")) and bool(neg.get("sctpPort")),
+        "appMedia=%s  sctpPort=%s" % (neg.get("appMedia"), neg.get("sctpPort")))
+
+    add("遥操作通道已打开", t.get("dcState") == "open",
+        "dcState=%s  label=%s" % (t.get("dcState"), t.get("label")))
+
+    sent = t.get("sent") or 0
+    if sent == 0 and not args.teleop_allow_idle:
+        add("发过遥操作命令", False,
+            "一条都没发。在页面上点几个快捷按钮再来分析；"
+            "如果这次本来就不打算操作，加上 --teleop-allow-idle")
+        return
+    if sent == 0:
+        add("未发遥操作命令（--teleop-allow-idle）", True,
+            "这次没有操作，遥操作只验到「通道已打开」这一层")
+        return
+
+    acked = t.get("acked") or 0
+    nacked = t.get("nacked") or 0
+    unanswered = t.get("unanswered") or 0
+    # 这个等式就是"没有命令被悄悄吞掉"。少一条（ACK 也没、NACK 也没）时，
+    # 页面只会显示"已发 10"，看起来一切正常。
+    add("每条命令都有回执", sent == acked + nacked and unanswered == 0,
+        "已发 %d = ACK %d + NACK %d，待回执 %d" % (sent, acked, nacked, unanswered))
+
+    unexpected = t.get("unexpected") or 0
+    echo_bad = t.get("echoBad") or 0
+    add("回执与发出的命令一一对应", unexpected == 0 and echo_bad == 0,
+        "重复/陌生回执 %d 条，回显不一致 %d 条（两样都说明配对逻辑坏了，"
+        "而不是链路" % (unexpected, echo_bad))
+
+    p95 = t.get("p95Rtt")
+    add("往返延迟 p95 达标", p95 is not None and p95 < args.teleop_max_p95,
+        "p95 = %s ms（上限 %.0f）；p50 = %s ms"
+        % ("—" if p95 is None else "%.1f" % p95, args.teleop_max_p95,
+           "—" if t.get("p50Rtt") is None else "%.1f" % t["p50Rtt"]))
+
+    if args.teleop_expect_nack:
+        # 白名单是板子在把关，而不是页面在本地拦下来的 —— 只有真的发了一条
+        # 白名单外的命令并收到 nack 才能证明这件事。
+        add("白名单外的命令被拒绝", nacked > 0,
+            "NACK %d 条，原因 %s" % (nacked, json.dumps(t.get("nackReasons") or {},
+                                                       ensure_ascii=False)))
+
+    # ---- 板端佐证 ----
+    if not device:
+        add("板端遥操作计数可核对", False,
+            "没有设备侧样本（role=device），页面记的账无法交叉核对")
+        return
+    d = device[-1]
+    rx = d.get("teleop_rx")
+    if rx is None:
+        add("板端遥操作计数可核对", False,
+            "设备样本里没有 teleop_* 字段（板子上跑的是旧代码？）")
+        return
+    lag = args.teleop_device_lag
+    b_ack = d.get("teleop_ack") or 0
+    overlay = d.get("teleop_overlay") or 0
+    # 三个都用**双边的差**，不用单向的 >=：单向只拦"板端少了"，放过"板端多了"
+    # —— 而板端多了恰好是回执在路上丢了的表现（板子发了 14 条 ACK，页面只
+    # 收到 12 条），也是一条该被看见的坏法。
+    add("板端收到的条数和页面一致", abs(rx - sent) <= lag,
+        "板端 teleop_rx=%d，页面已发 %d（允许差 %d）" % (rx, sent, lag))
+    add("板端 ACK 数和页面一致", abs(b_ack - acked) <= lag,
+        "板端 teleop_ack=%d，页面 ACK %d（允许差 %d；差得多说明有 ACK 没到页面）"
+        % (b_ack, acked, lag))
+    # 这一条才是"命令真的被执行了"：overlay 只在命令通过校验、并写进
+    # textoverlay 时才涨。光有 ACK 的话，通道通、画面死了也会显示一切正常。
+    add("画面叠加次数跟得上回执", abs(overlay - b_ack) <= lag,
+        "板端 teleop_overlay=%d，teleop_ack=%d —— 两者对不上说明回执和"
+        "画面不是同一条路" % (overlay, b_ack))
+
+
 def run_checks(browser, device, args):
     checks = []
 
@@ -541,6 +637,14 @@ def run_checks(browser, device, args):
             "加 --audio 才检查音频。阶段二的验证请带上它 —— "
             "视频的判据全都通过、音频一路都不通，是完全可能的")
 
+    # ---- 遥操作（阶段三）----
+    if args.teleop:
+        teleop_checks(add, last, device, args)
+    else:
+        add("遥操作判据未启用", True,
+            "加 --teleop 才检查遥操作。命令是模拟执行的，"
+            "不看回执和画面叠加就说「控制回路通了」是没有依据的")
+
     # ---- 播放位置：区分"源头停了"和"编不动了" ----
     t0 = first.get("srcTime")
     t1 = last.get("srcTime")
@@ -588,6 +692,19 @@ def main():
                         "inbound-rtp.bytesReceived 报 80 字节/包，所以这条判据的"
                         "「完美值」本来就是 80/92≈0.87。用 15%% 去卡只剩 2 个点"
                         "余量，正常抖一下就红")
+    p.add_argument("--teleop", action="store_true",
+                   help="阶段三：检查遥操作（通道、回执配对、往返延迟、画面叠加）")
+    p.add_argument("--teleop-allow-idle", action="store_true",
+                   help="允许这次一条命令都没发（只验到「通道已打开」）。"
+                        "默认不允：没发过命令就不能说控制回路验过了")
+    p.add_argument("--teleop-expect-nack", action="store_true",
+                   help="要求至少收到一条 NACK。用来证明白名单是板子在把关 —— "
+                        "在页面上发一条 BOGUS 再跑")
+    p.add_argument("--teleop-max-p95", type=float, default=300.0,
+                   help="遥操作往返延迟 p95 的上限（毫秒）")
+    p.add_argument("--teleop-device-lag", type=int, default=2,
+                   help="板端计数允许比页面账本落后多少条。命令走 SCTP、"
+                        "计数走 HTTP 遥测，两条路不同步，严格相等会误判")
     p.add_argument("--min-fps", type=float, default=12.0,
                    help="稳态帧率下限。板子实测的编码上限约 20.4fps"
                         "（720p UYVY，rkisp 吞吐限制 —— 不是 CPU，8 核负载 0.14，"

@@ -37,6 +37,23 @@
     content:"摄像头"; color:var(--dim); font-size:12px; margin-right:2px;
   }
   .cams:empty { display:none; }
+  /* 遥操作条。样式刻意和上面那条 bar 一样 —— 它是同一条控制带，
+     不是另一块面板。可用的按钮在通道打开前置灰：点一个"发了但没出去"
+     的按钮，比按钮灰着更让人误解。 */
+  .teleop::before {
+    content:"遥操作"; color:var(--dim); font-size:12px; margin-right:2px;
+  }
+  #cmdInput {
+    flex:1 1 240px; min-width:150px; background:#161a21; color:var(--fg);
+    border:1px solid var(--line); border-radius:6px; padding:6px 10px;
+    font:inherit; font-variant-numeric:tabular-nums;
+  }
+  #cmdInput:focus { outline:1px solid #4a7dd6; border-color:#4a7dd6; }
+  #cmdInput::placeholder { color:#5c6474; }
+  .quick { display:flex; gap:6px; flex-wrap:wrap; }
+  #teleopStatus.ok { color:var(--ok); }
+  #teleopStatus.warn { color:var(--warn); }
+  #teleopStatus.err { color:var(--err); }
   .stage { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:12px; }
   @media (max-width:900px){ .stage{grid-template-columns:1fr} }
   video {
@@ -66,6 +83,18 @@
        清单为空时 .cams:empty 会整块隐藏，不留一个空标签。 -->
   <span class="cams" id="cams"></span>
   <span id="status" class="status">未连接</span>
+</div>
+
+<div class="bar teleop">
+  <!-- 命令台。命令是**模拟执行**的：板子收到的唯一动作就是把命令写进画面，
+       所以"这条命令到底有没有到板子"只能靠 ACK 和画面里的那行字来证。
+       输入框和快捷按钮走同一个 sendTeleop()，不各写一套。 -->
+  <input id="cmdInput" type="text" placeholder="FORWARD 12 / STOP / SPEED 50"
+         autocomplete="off" spellcheck="false">
+  <button id="cmdSend">发送</button>
+  <!-- 快捷按钮由 QUICK_COMMANDS 生成：写死标记的话，命令和参数会各改各的 -->
+  <span class="quick" id="quickCmds"></span>
+  <span id="teleopStatus" class="status">通道 未建立</span>
 </div>
 
 <div class="stage">
@@ -104,7 +133,7 @@ let iceServers = [];          // 从 /ice.json 拿到的 STUN/TURN 配置
 // 样本里新字段是空的 —— 分不清是"用户没刷"、"浏览器吃了缓存"还是"我字段名
 // 写错了"。有了版本号，样本自己就说得出跑的是哪版 JS，不用再靠 md5 猜。
 // 每次改这个文件都要动这里。
-const PAGE_VERSION = "2026-10-14.5";
+const PAGE_VERSION = "2026-10-18.1";
 
 let lastStats = null;         // 最近一次完整样本，供 diag 上报
 const pendingCandidates = []; // setRemoteDescription 之前到达的候选先缓存
@@ -381,6 +410,12 @@ function sampleFrame() {
 function createPc() {
   pc = new RTCPeerConnection({ iceServers, bundlePolicy:"max-bundle" });
 
+  /* 遥操作通道是**板子建的**（它是 offerer），这边只能通过 ondatachannel 接。
+     这一行必须在任何 setRemoteDescription 之前挂好：通道跟着 answer 立刻
+     建立，挂晚了第一个（也是唯一一个）通道就丢了，而板子全程不重协商。
+     症状会是"页面一切正常，就是命令一条都发不出去"。 */
+  pc.ondatachannel = (ev) => attachTeleopChannel(ev.channel);
+
   /* 麦克风音轨必须在**任何 setRemoteDescription 之前**加进来。
      这是踩过的顺序问题：等协商完了再 addTrack，浏览器只会标记"需要重新协商"，
      而本方案是单次 offer、不重协商（见 docs），于是那一路上永远停在 recvonly ——
@@ -455,6 +490,7 @@ function teardownPc() {
   prevSample = null;
   lastStats = null;
   statsEl.textContent = "等待发布端…";
+  resetTeleop();
 }
 
 /* 把板子 offer 里的 m-line 和方向打出来。
@@ -485,6 +521,265 @@ function logOfferMedia(sdp) {
       ? "  offer 里有 opus/48000 —— 板子那路麦克风已经在推了"
       : "  !! offer 里没有 opus/48000：板子侧音频分支没建起来。"
         + "去看它的启动日志，多半是 AudioUnavailable 或者用了 --no-audio");
+}
+
+/* ------------------------------------------------------------ 遥操作
+   回路的形状（和板子的协议见 src/teleop.py）：
+
+     页面发 {"t":"cmd","seq":N,"cmd":"FORWARD","arg":12,"ts":...}
+     板子回 {"t":"ack","seq":N,"cmd":"FORWARD","ts":...,"ms":3.2}
+     板子回 {"t":"nack","seq":N,"cmd":"...","ts":...,"reason":"unknown-command"}
+
+   为什么非要这组 seq/ACK：命令是模拟执行的，没有电机可以看。ACK 证明
+   "板子收到了"，画面里那行 `CMD #N ...` 证明"板子执行了" —— 两者缺一不可。
+   只有 ACK 的话，通道通、画面死了也会显示一切正常。 */
+
+//: 板子白名单的一份拷贝。**这份不是权威** —— 权威在板子上（见 teleop.py 的
+//: COMMANDS），这里只是把可用的命令渲染成快捷按钮。
+const TELEOP_COMMANDS = ["FORWARD", "BACK", "LEFT", "RIGHT", "STOP", "SPEED"];
+
+//: 快捷按钮。[命令, 参数]；参数为 null 就不带 arg。
+const QUICK_COMMANDS = [
+  ["FORWARD", 10], ["BACK", 10], ["LEFT", 10], ["RIGHT", 10],
+  ["STOP", null], ["SPEED", 50],
+];
+
+//: 参数范围和板子一致。超范围的在这里就被拦下，省一次往返 ——
+//: 但拦下来要说清是本地拦的，不然会以为是板子拒的。
+const TELEOP_ARG_MIN = -1000, TELEOP_ARG_MAX = 1000;
+
+const teleop = {
+  dc: null, label: null, state: "—",
+  seqMax: 0, sent: 0, acked: 0, nacked: 0,
+  unexpected: 0, echoBad: 0, wrongVerdict: 0, badReply: 0,
+  pending: new Map(),          // seq -> {cmd, ts, at, expectNack}
+  rtts: [],                    // 最近 100 条往返，p50/p95 就从这儿算
+  lastAckSeq: null, lastCmd: null, lastRtt: null,
+  p50Rtt: null, p95Rtt: null,
+  nackReasons: {},
+};
+
+/* 板子建的通道到了。只认 label === "teleop"：以后板子再加一路通道时，
+   这里应当多一条"不认识"的日志，而不是悄悄接到错误的通道上。 */
+function attachTeleopChannel(ch) {
+  if (ch.label !== "teleop") {
+    log(`收到一个 label=${ch.label} 的 DataChannel，不接（只认 teleop）`);
+    return;
+  }
+  teleop.dc = ch;
+  teleop.label = ch.label;
+  teleop.state = ch.readyState;
+
+  ch.onopen = () => {
+    log("遥操作 DataChannel 已打开");
+    teleop.state = ch.readyState;
+    renderTeleop();
+  };
+  ch.onclose = () => {
+    log("遥操作 DataChannel 已关闭");
+    teleop.state = ch.readyState;
+    // 通道关了，这些命令永远等不到回执了。留在待回执表里会让
+    // "unanswered" 变成一个永远不归零的数，看起来像一直有命令丢失。
+    teleop.pending.clear();
+    renderTeleop();
+  };
+  ch.onerror = (ev) => {
+    const err = ev && ev.error ? `${ev.error.name}: ${ev.error.message}` : "未知错误";
+    log("遥操作 DataChannel 出错: " + err);
+    renderTeleop();
+  };
+  ch.onmessage = (ev) => handleTeleopReply(ev.data);
+
+  log(`遥操作 DataChannel 已接到（label=${ch.label}，状态=${ch.readyState}）`);
+  renderTeleop();
+}
+
+/* 解析输入框。格式：`CMD` 或 `CMD 数字`。
+   这里**不拦白名单外**的命令 —— 故意放过去，让板子回 nack。理由是：
+   验收里要能在页面上发一条 BOGUS、看它被拒；如果页面先拦了，测的就成了
+   前端，而不是板子的白名单。放行时会在日志里说清楚"这条应当被拒"。 */
+function parseCmdText(text) {
+  const parts = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { error: "命令是空的" };
+  if (parts.length > 2) return { error: "格式是 `CMD` 或 `CMD 数字`" };
+
+  const cmd = parts[0].toUpperCase();
+  if (!/^[A-Z][A-Z0-9_-]*$/.test(cmd)) {
+    return { error: "命令名只能用字母、数字、下划线" };
+  }
+
+  let arg = null;
+  if (parts.length === 2) {
+    if (!/^-?\d+$/.test(parts[1])) return { error: "参数必须是整数" };
+    arg = Number(parts[1]);
+    if (arg < TELEOP_ARG_MIN || arg > TELEOP_ARG_MAX) {
+      return { error: `参数要在 ${TELEOP_ARG_MIN}..${TELEOP_ARG_MAX} 之间` };
+    }
+  }
+  if (cmd === "SPEED" && arg === null) {
+    return { error: "SPEED 必须带参数，例如 `SPEED 50`" };
+  }
+  return { cmd, arg, known: TELEOP_COMMANDS.includes(cmd) };
+}
+
+function submitCmdInput() {
+  const input = $("cmdInput");
+  const parsed = parseCmdText(input.value);
+  if (parsed.error) {
+    log("遥操作：输入不合法 —— " + parsed.error);
+    input.focus();
+    return;
+  }
+  if (!parsed.known) {
+    log(`遥操作：${parsed.cmd} 不在板子白名单里，照发 —— 应当收到 nack`);
+  }
+  if (sendTeleop(parsed.cmd, parsed.arg)) {
+    input.value = "";
+    input.focus();
+  }
+}
+
+/* 发一条命令。返回是否真的发出去了。 */
+function sendTeleop(cmd, arg) {
+  if (!teleop.dc || teleop.dc.readyState !== "open") {
+    log(`遥操作：通道没打开（${teleop.dc ? teleop.dc.readyState : "没有通道"}），`
+        + `${cmd} 没发出去`);
+    renderTeleop();
+    return false;
+  }
+  const seq = ++teleop.seqMax;
+  const ts = performance.now();
+  const msg = { t:"cmd", seq, cmd, ts };
+  if (arg !== null && arg !== undefined) msg.arg = arg;
+
+  teleop.pending.set(seq, {
+    cmd, ts, at: performance.now(),
+    expectNack: !TELEOP_COMMANDS.includes(cmd),
+  });
+  try {
+    teleop.dc.send(JSON.stringify(msg));
+  } catch (e) {
+    teleop.pending.delete(seq);
+    log("遥操作发送失败: " + e.message);
+    renderTeleop();
+    return false;
+  }
+  teleop.sent++;
+  teleop.lastCmd = cmd;
+  log(`→ #${seq} ${cmd}${msg.arg !== undefined ? " " + msg.arg : ""}`);
+  renderTeleop();
+  return true;
+}
+
+function handleTeleopReply(data) {
+  let msg;
+  try { msg = JSON.parse(data); }
+  catch {
+    teleop.badReply++;
+    log("遥操作：回执不是 JSON: " + String(data).slice(0, 80));
+    renderTeleop();
+    return;
+  }
+  if (!msg || typeof msg !== "object") {
+    teleop.badReply++;
+    log("遥操作：回执不是对象");
+    renderTeleop();
+    return;
+  }
+
+  const rec = teleop.pending.get(msg.seq);
+  if (!rec) {
+    // 重复的回执、或者根本没发过的 seq。两种都说明配对坏了。
+    teleop.unexpected++;
+    log(`遥操作：回执 seq=${msg.seq} 不在待回执表里（重复或凭空多出来的）`);
+    renderTeleop();
+    return;
+  }
+  teleop.pending.delete(msg.seq);
+
+  if (msg.cmd !== rec.cmd || msg.ts !== rec.ts) {
+    teleop.echoBad++;
+    log(`遥操作：回执回显不一致 seq=${msg.seq}`
+        + `（cmd ${rec.cmd}→${msg.cmd}，ts 一致=${msg.ts === rec.ts}）`);
+  }
+
+  if (msg.t === "ack") {
+    teleop.acked++;
+    const rtt = performance.now() - rec.at;
+    teleop.rtts.push(rtt);
+    if (teleop.rtts.length > 100) teleop.rtts.shift();
+    teleop.lastRtt = rtt;
+    teleop.lastAckSeq = msg.seq;
+    if (rec.expectNack) {
+      teleop.wrongVerdict++;
+      log(`!! seq=${msg.seq}（${rec.cmd}）不在白名单里，却被 ACK 了`);
+    } else {
+      log(`← ACK #${msg.seq} ${msg.cmd}  rtt ${rtt.toFixed(1)} ms`
+          + `（板端 ${msg.ms} ms）`);
+    }
+  } else if (msg.t === "nack") {
+    teleop.nacked++;
+    teleop.nackReasons[msg.reason] = (teleop.nackReasons[msg.reason] || 0) + 1;
+    if (!rec.expectNack) teleop.wrongVerdict++;
+    log(`← NACK #${msg.seq} ${msg.cmd}  原因 ${msg.reason}`);
+  } else {
+    teleop.badReply++;
+    log(`遥操作：回执 t=${msg.t} 不认识`);
+  }
+  renderTeleop();
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return null;
+  const i = Math.min(sorted.length - 1, Math.round(p * (sorted.length - 1)));
+  return sorted[i];
+}
+
+function renderTeleop() {
+  const el = $("teleopStatus");
+  const open = !!(teleop.dc && teleop.dc.readyState === "open");
+  teleop.state = teleop.dc ? teleop.dc.readyState : "—";
+
+  const rtts = teleop.rtts.slice().sort((a, b) => a - b);
+  teleop.p50Rtt = percentile(rtts, 0.50);
+  teleop.p95Rtt = percentile(rtts, 0.95);
+
+  const bits = [`通道 ${teleop.state}`, `已发 ${teleop.sent}`,
+                `ACK ${teleop.acked}`, `NACK ${teleop.nacked}`];
+  if (teleop.pending.size) bits.push(`待回执 ${teleop.pending.size}`);
+  if (teleop.p95Rtt != null) bits.push(`p95 ${teleop.p95Rtt.toFixed(1)} ms`);
+  if (teleop.nacked) {
+    bits.push("拒因 " + Object.entries(teleop.nackReasons)
+      .map(([k, v]) => `${k}×${v}`).join(","));
+  }
+  el.textContent = bits.join(" · ");
+
+  // 只有真的打开才是 ok。"connecting" 用 warn —— 和"没有通道"分开，
+  // 因为一个是要等，一个是要去查 offer 里有没有 m=application。
+  el.className = "status " + (open ? "ok" : (teleop.state === "connecting" ? "warn" : "err"));
+
+  // 按钮可用态：通道没开就点不动。输入框保持可用，方便先打好再发。
+  const dis = !open;
+  $("cmdSend").disabled = dis;
+  document.querySelectorAll("#quickCmds button").forEach((b) => { b.disabled = dis; });
+}
+
+/* 拆会话时把遥操作的账一起清掉。通道属于 PeerConnection，pc 一关它就没用了；
+   计数必须同步清零，否则新会话的 "sent == acked + nacked" 会拿旧账凑数，
+   而 analyze_diag 正是拿这个等式当判据的。 */
+function resetTeleop() {
+  teleop.dc = null;
+  teleop.label = null;
+  teleop.state = "—";
+  teleop.seqMax = 0;
+  teleop.sent = teleop.acked = teleop.nacked = 0;
+  teleop.unexpected = teleop.echoBad = teleop.wrongVerdict = teleop.badReply = 0;
+  teleop.pending.clear();
+  teleop.rtts.length = 0;
+  teleop.lastAckSeq = teleop.lastCmd = teleop.lastRtt = null;
+  teleop.p50Rtt = teleop.p95Rtt = null;
+  teleop.nackReasons = {};
+  renderTeleop();
 }
 
 /* ------------------------------------------------------------ 连接流程 */
@@ -696,20 +991,34 @@ async function collectStats() {
   // 权威来源。看 nackCount=0 只能知道"浏览器没发过重传请求"，说明不了
   // "是没协商上还是不需要"；那要翻这里的 a=rtcp-fb 和 a=rtx。
   // 支持重传需要三样同时在：a=rtcp-fb:<pt> nack、a=rtx:<pt2>、a=fmtp:<pt2> apt=<pt>。
+  /* 遥操作这一路只看得到"通道开没开"，看不到"为什么没开"。把 remote SDP 里
+     这两项带回去，才能在事后把两种完全不同的坏法分开：
+       appMedia=false  → 板子的 offer 里就没有 m=application（create-data-channel
+                         没在 create-offer 之前调，或者返回了 None）
+       appMedia=true 而 sctpPort=null → 有这一节但没有 a=sctp-port，浏览器不会
+                         建出通道（板子侧 SCTP 没协商上）
+     两者在页面上表现一样：通道一直是 connecting。 */
   function negSummary() {
     const sdp = pc.remoteDescription && pc.remoteDescription.sdp;
     if (!sdp) return null;
     const mlines = [], rtcpFb = [];
     let rtxLines = 0, aptLines = 0, rtcpMux = false;
+    let appMedia = false, sctpPort = null;
     for (const raw of sdp.split(/\r?\n/)) {
       const line = raw.trim();
-      if (line.startsWith("m=")) mlines.push(line);
+      if (line.startsWith("m=")) {
+        mlines.push(line);
+        if (line.startsWith("m=application")) appMedia = true;
+      }
       else if (line.startsWith("a=rtcp-fb:")) rtcpFb.push(line);
       else if (line.startsWith("a=rtx:")) rtxLines++;
       else if (line.includes("apt=")) aptLines++;
       else if (line.startsWith("a=rtcp-mux")) rtcpMux = true;
+      else if (line.startsWith("a=sctp-port:")) {
+        sctpPort = line.slice("a=sctp-port:".length).trim();
+      }
     }
-    return { mlines, rtcpFb, rtxLines, aptLines, rtcpMux };
+    return { mlines, rtcpFb, rtxLines, aptLines, rtcpMux, appMedia, sctpPort };
   }
 
   // 这份样本还要上报给服务器，多存一份免得 postDiag 里再算一遍。
@@ -717,6 +1026,29 @@ async function collectStats() {
     pageVersion: PAGE_VERSION,
     browser: navigator.userAgent,
     negotiation: negSummary(),
+    // 遥操作：这几个数就是 analyze_diag.py --teleop 的全部输入。
+    // 它们是**页面自己记的账**，所以分析器还要拿板子 /diag 里的
+    // teleop_rx/teleop_ack/teleop_overlay 做一次交叉核对 —— 只有页面
+    // 自己记的话，"发送后凭空补一条 ACK"这种坏法看不出来。
+    teleop: {
+      dcState: teleop.dc ? teleop.dc.readyState : null,
+      label: teleop.label,
+      sent: teleop.sent,
+      acked: teleop.acked,
+      nacked: teleop.nacked,
+      unanswered: teleop.pending.size,
+      unexpected: teleop.unexpected,
+      echoBad: teleop.echoBad,
+      wrongVerdict: teleop.wrongVerdict,
+      badReply: teleop.badReply,
+      seqMax: teleop.seqMax,
+      lastAckSeq: teleop.lastAckSeq,
+      lastCmd: teleop.lastCmd,
+      lastRtt: teleop.lastRtt,
+      p50Rtt: teleop.p50Rtt,
+      p95Rtt: teleop.p95Rtt,
+      nackReasons: Object.assign({}, teleop.nackReasons),
+    },
     video: {
       bytesReceived: inbound.bytesReceived,
       packetsReceived: inbound.packetsReceived,
@@ -991,6 +1323,22 @@ window.addEventListener("beforeunload", () => send({ type:"bye" }));
 $("talkBtn").addEventListener("click", () => {
   startTalk().catch((e) => log("startTalk 抛异常: " + e.message));
 });
+
+/* 遥操作接线。按钮在这里生成而不是写进 HTML：命令名和参数只在
+   QUICK_COMMANDS 里出现一次，改一处就够，不会出现"按钮写着 SPEED 但发的是
+   SPEED 5"这种对不上的情况。初始 renderTeleop() 把按钮置灰 —— 那时通道
+   必然还没建立。 */
+$("cmdSend").addEventListener("click", submitCmdInput);
+$("cmdInput").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") { ev.preventDefault(); submitCmdInput(); }
+});
+for (const [cmd, arg] of QUICK_COMMANDS) {
+  const b = document.createElement("button");
+  b.textContent = arg === null ? cmd : `${cmd} ${arg}`;
+  b.addEventListener("click", () => sendTeleop(cmd, arg));
+  $("quickCmds").appendChild(b);
+}
+renderTeleop();
 
 log(`页面来自 ${location.host}，自动连接…`);
 // 提前说一句，免得用户以为对讲坏了。这里只提示，不阻止连接 ——
