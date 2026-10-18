@@ -34,7 +34,7 @@ KEY=certs/board.key
 mkdir -p certs
 
 # 已经覆盖这个 IP 就不重签。\b 是必要的：不加的话 192.168.2.1 会误判成
-# 已经覆盖 192.168.2.187（前缀相同）。
+# 已经覆盖 192.168.2.100（前缀相同）。
 if [ -s "$CERT" ] && [ -s "$KEY" ]; then
     if openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null \
        | grep -q "IP Address:$IP\b"; then

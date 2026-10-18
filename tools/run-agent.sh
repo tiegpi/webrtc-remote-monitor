@@ -49,6 +49,6 @@ exec python3 src/device_agent.py \
   --room "$ROOM" \
   --token "$TOKEN" \
   --signal-auth "$SIGNAL_AUTH" \
-  --tls-ca vps-self.crt \
+  --tls-ca certs/vps-self.crt \
   --camera-wb auto \
   "$@"

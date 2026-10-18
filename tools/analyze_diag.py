@@ -18,7 +18,7 @@ analyze_diag.py —— 判据检查器
 
 用法：
     python3 tools/analyze_diag.py --url http://127.0.0.1:8080 --room demo
-    python3 tools/analyze_diag.py --url https://124.223.11.112 \
+    python3 tools/analyze_diag.py --url https://<VPS> \
         --auth viewer:密码 --insecure --room 70ef7d99
     python3 tools/analyze_diag.py --file samples.json
 """

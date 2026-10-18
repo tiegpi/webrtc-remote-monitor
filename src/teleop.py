@@ -7,7 +7,7 @@
 `tools/selftest.py` 用的是同一份代码；协议单测也能在没有 GStreamer 的
 宿主机上直接跑（见 tools/check_teleop.py）。
 
-协议（PLAN-phase2-3.md 第 182 行起）：
+协议：
 
     浏览器 → 板子   {"t":"cmd","seq":7,"cmd":"FORWARD","arg":12,"ts":1728...}
     板子 → 浏览器   {"t":"ack","seq":7,"cmd":"FORWARD","ts":...,"ms":3.2}
@@ -17,7 +17,7 @@
 分不清是命令不合法、DataChannel 断了还是板子没执行 —— 而这三件事要改的地方
 完全不同。回执让每一种失败都留下名字。
 
-`on-message` 这个名字是 PLAN 里凭印象写的；GStreamer 1.20.3 实测没有它，
+`on-message` 这个名字是早期计划里凭印象写的；GStreamer 1.20.3 实测没有它，
 只有 `on-message-string` / `on-message-data`。`connect_message()` 按新名到旧名
 依次尝试，别的版本上也不会因为名字不同而静默收不到命令。
 """
@@ -177,7 +177,7 @@ def overlay_text(seq, cmd, arg=None, when=""):
 def connect_message(channel, handler):
     """给 DataChannel 挂消息回调，返回**实际连上**的信号名。
 
-    1.20.3 上只有 on-message-string / on-message-data；PLAN 里写的 on-message
+    1.20.3 上只有 on-message-string / on-message-data；早期计划里写的 on-message
     在真机上不存在。依次试，别用 hasattr 猜 —— GObject 的属性表里没有信号。
     """
     attempts = ("on-message-string", "on-message-data", "on-message")

@@ -1,9 +1,13 @@
 #!/bin/bash
 # 一条命令改观看端 Basic Auth 密码，并让板子同步 —— 不用整包重部署。
 #
-#     bash tools/set_view_password.sh '新密码'
+#     VPS_HOST=ubuntu@<vps> BOARD_HOST=orangepi@<board> \
+#         bash tools/set_view_password.sh '新密码'
 #     VIEW_USER=gtie bash tools/set_view_password.sh '新密码'
 #     VIEW_PASS='新密码' bash tools/set_view_password.sh     # 密码不进 shell 历史
+#
+# VPS_HOST / BOARD_HOST 是 ssh 目标；VIEW_URL 默认由 .env 里的
+# SIGNAL_HOST 拼成 https://<SIGNAL_HOST>/webrtc。
 #
 # 做的事：
 #   1. VPS：重写 /etc/nginx/webrtc-view.htpasswd（apr1）和
@@ -21,10 +25,16 @@
 # 这个只改凭证。两者写的是同一组文件，不会互相打架。
 set -euo pipefail
 
-VPS_HOST="${VPS_HOST:-ubuntu@124.223.11.112}"
-BOARD_HOST="${BOARD_HOST:-orangepi@192.168.2.187}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$HERE/.env" ]; then . "$HERE/.env"; fi
+
+: "${VPS_HOST:?没设 VPS_HOST —— VPS 的 ssh 目标，如 ubuntu@1.2.3.4}"
+: "${BOARD_HOST:?没设 BOARD_HOST —— 板子的 ssh 目标，如 orangepi@192.168.2.100}"
+VIEW_URL="${VIEW_URL:-${SIGNAL_HOST:+https://$SIGNAL_HOST/webrtc}}"
+: "${VIEW_URL:?没设 VIEW_URL 或 SIGNAL_HOST —— 见 .env.example}"
+
 BOARD_DIR="${BOARD_DIR:-/home/orangepi/webrtc-remote-monitor}"
-VIEW_URL="${VIEW_URL:-https://124.223.11.112/webrtc}"
+BOARD_ADDR="${BOARD_HOST#*@}"
 VIEW_USER="${VIEW_USER:-viewer}"
 
 die() { echo "错误：$*" >&2; exit 1; }
@@ -142,7 +152,7 @@ echo "  VPS：未登录 401，登录后 200"
 # 板子进程刚起，给它几秒。
 ICE=""
 for _ in $(seq 1 20); do
-    ICE="$(curl -sk --max-time 5 "https://192.168.2.187:8443/ice.json" 2>/dev/null || true)"
+    ICE="$(curl -sk --max-time 5 "https://$BOARD_ADDR:8443/ice.json" 2>/dev/null || true)"
     printf '%s' "$ICE" | grep -q . && break
     sleep 1
 done

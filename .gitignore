@@ -3,10 +3,10 @@
 # 泄露了等于把摄像头公开。模板见 .env.example。
 .env
 
-# 自签证书。board.key 是私钥；vps-self.crt 是 VPS 自签叶证书，当信任锚用，
-# 换台机器重新签发一张就行，没有进仓库的必要。
+# 自签证书。certs/board.key 是私钥；certs/vps-self.crt 是 VPS 自签叶证书，
+# 当信任锚用，换台机器重新签发一张就行，没有进仓库的必要。
+# 整目录忽略，因为生成工具（tools/gen_cert.sh）和运行脚本都按 certs/ 取文件。
 certs/
-vps-self.crt
 
 __pycache__/
 *.pyc

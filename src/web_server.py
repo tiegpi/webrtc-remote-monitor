@@ -373,8 +373,9 @@ def parse_args(argv=None):
     p.add_argument("--port", type=int, default=8080, help="监听端口")
     p.add_argument("--host", default="0.0.0.0", help="监听地址")
     p.add_argument("--web-dir", default="web", help="页面目录（相对项目根）")
-    p.add_argument("--signal", default="https://124.223.11.112",
-                   help="信令服务器根地址。信令相关请求都转到这里")
+    p.add_argument("--signal", default="http://127.0.0.1:8080",
+                   help="信令服务器根地址。信令相关请求都转到这里。"
+                        "公网部署时用 run-web.sh 传 https://<VPS>")
     p.add_argument("--signal-auth", default=None, metavar="USER:PASS",
                    help="转发到 VPS 时用的 HTTP Basic Auth。板子中转必须给；"
                         "VPS 本机代理 127.0.0.1:8443 时不需要")

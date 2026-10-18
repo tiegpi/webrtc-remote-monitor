@@ -3,13 +3,16 @@
 # 同一个 monitor.html。
 #
 # 用法（在开发机上跑，需要能免密 ssh $VPS_HOST）:
-#     bash tools/deploy_web_vps.sh
-#     VPS_HOST=ubuntu@1.2.3.4 bash tools/deploy_web_vps.sh
+#     VPS_HOST=ubuntu@<vps-ip> bash tools/deploy_web_vps.sh
+#     VPS_HOST=ubuntu@<vps-ip> PUBLIC_HOST=<public-host> bash tools/deploy_web_vps.sh
+#
+# PUBLIC_HOST 是外网访问用的主机名/IP，默认取 .env 里的 SIGNAL_HOST；
+# 不填就只用于脚本末尾的提示，不影响部署本身。
 #
 # 部署后的两条观看路径（同一个页面，两个来源）:
 #
 #     局域网  浏览器 → https://<板子>:8443/ → 板子的 web_server（原有路径，无鉴权）
-#     外网    浏览器 → https://124.223.11.112/webrtc → nginx(Basic Auth) → VPS web_server
+#     外网    浏览器 → https://<PUBLIC_HOST>/webrtc → nginx(Basic Auth) → VPS web_server
 #
 # 媒体（RTP）在两种情况下都**不经过这个 web_server**：局域网是 host candidate
 # 直连板子；跨网是 TURN 中继，走 VPS 上的 coturn。这里只送页面和信令。
@@ -53,8 +56,10 @@
 #   属于另一件事，见 docs/architecture.md 的说明。
 set -euo pipefail
 
-VPS_HOST="${VPS_HOST:-ubuntu@124.223.11.112}"
+: "${VPS_HOST:?没设 VPS_HOST —— VPS 的 ssh 目标，如 ubuntu@1.2.3.4}"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$SRC/.env" ]; then . "$SRC/.env"; fi
+PUBLIC_HOST="${PUBLIC_HOST:-${SIGNAL_HOST:-${VPS_HOST#*@}}}"
 
 # 观看端账号。密码留空 = 首次随机生成、之后复用 /root/webrtc-view.credentials。
 # 用 base64 传给远端，避免密码里的引号 / $ / 空格把远端 shell 搞坏。
@@ -360,7 +365,7 @@ NGINX
 
 # 两处 nginx 站点改动：
 #
-#   80  → 统一 301 到 https。否则用户手敲 http://124.223.11.112/ 会看到
+#   80  → 统一 301 到 https。否则用户手敲 http://<PUBLIC_HOST>/ 会看到
 #         nginx 的默认欢迎页，像"没部署成功"；而且浏览器麦克风只在 https 的
 #         安全上下文里存在。
 #   443 → 原本有一个 location /（try_files 静态文件），会和 snippet 里的
@@ -491,8 +496,8 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "部署完成。"
-echo "  外网观看页： https://124.223.11.112/webrtc  （需要登录）"
-echo "  根路径：     https://124.223.11.112/  → 404，不再跳转"
+echo "  外网观看页： https://$PUBLIC_HOST/webrtc  （需要登录）"
+echo "  根路径：     https://$PUBLIC_HOST/  → 404，不再跳转"
 echo "  局域网页面： https://<板子IP>:8443/  （不变，无鉴权）"
 echo
 echo "  观看端账号： $VIEW_USER"

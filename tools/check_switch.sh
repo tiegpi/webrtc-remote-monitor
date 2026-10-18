@@ -17,7 +17,7 @@
 #
 # 用法（在**板子**上跑，或者任何能访问到页面地址的机器）：
 #     tools/check_switch.sh                       # 默认 https://127.0.0.1:8443
-#     tools/check_switch.sh --base https://192.168.2.187:8443
+#     tools/check_switch.sh --base https://<board-ip>:8443
 #     tools/check_switch.sh --settle 20 --keep    # 切完不回切
 set -uo pipefail
 

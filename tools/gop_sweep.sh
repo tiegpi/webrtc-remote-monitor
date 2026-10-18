@@ -11,11 +11,11 @@
 # 各浏览器不一样，所以脚本会先确认"新的一段是不是重启之后才开始的"；不是就
 # 明确报出来要人刷新，绝不拿旧数据凑数。
 #
-# 用法（在本地跑，浏览器开着页面）：
-#     tools/gop_sweep.sh 60 20 10
+# 用法（在本地跑，浏览器开着页面；BOARD 是 ssh 目标）：
+#     BOARD=orangepi@<board-ip> tools/gop_sweep.sh 60 20 10
 set -uo pipefail
 
-BOARD=orangepi@192.168.2.187
+BOARD="${BOARD:?没设 BOARD —— 板子的 ssh 目标，如 orangepi@192.168.2.100}"
 NEED=120          # 每档至少要多少条样本（1Hz，约 2 分钟）
 WAIT=300          # 等一段新数据的上限（秒）
 HERE="$(cd "$(dirname "$0")/.." && pwd)"

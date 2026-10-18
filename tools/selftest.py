@@ -20,7 +20,7 @@ setRemoteDescription 之前加进去时，浏览器照样显示"正在发送"，
 
     本地（WSL）跑，让它去连板子 —— 这就是"笔记本浏览器连板子"的真实拓扑：
         python3 tools/selftest.py --signal https://<SIGNAL_HOST> \\
-            --room <ROOM> --tls-ca vps-self.crt --duration 20
+            --room <ROOM> --tls-ca certs/vps-self.crt --duration 20
 
     --no-send-audio   只测 A（收板子的音频），B 那一路不建
     --no-teleop       完全不要求 DataChannel（阶段一/二的行为）
@@ -984,7 +984,7 @@ def main(argv=None):
         description="无头 WebRTC 对端：验证双向音频和遥操作"
                     "（不需要浏览器/麦克风/耳朵）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--signal", default="https://124.223.11.112",
+    p.add_argument("--signal", required=True,
                    help="信令服务器根地址（ws:// 或 wss:// 的完整地址也认）")
     p.add_argument("--room", required=True)
     p.add_argument("--auth", default=None, metavar="USER:PASS",

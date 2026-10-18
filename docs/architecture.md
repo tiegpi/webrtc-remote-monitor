@@ -1,5 +1,8 @@
 # 架构与流程
 
+> 作品集入口见 [README.md](../README.md)（英文概览）与
+> [README.zh-CN.md](../README.zh-CN.md)（中文快速上手）。这份文档是深潜版。
+
 这份文档回答三个问题：**东西是怎么搭起来的**、**为什么这么搭**、**怎么证明它真的在工作**。
 
 代码里的注释写的是"这一行为什么长这样"，这份文档写的是"这台机器为什么长这样"。
@@ -34,7 +37,7 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 几个看起来该在服务器的职责其实在板子上。
 
 ```
-        ┌─ 公网 VPS（124.223.11.112）────────────────────────┐
+        ┌─ 公网 VPS（<VPS_IP>）──────────────────────────────┐
         │  nginx :443         外网唯一入口（TLS，自签证书）     │
         │    /ws/publish          → 127.0.0.1:8443（token）  │
         │    /ws/view /diag /ice.json → 8443（Basic Auth）   │
@@ -45,9 +48,9 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
         │  coturn  :3478          STUN/TURN（兜底）           │
         └────────────────────────────────────────────────────┘
                   ▲                    ▲                 ▲
-           wss /ws/publish      wss /ws/view       https://124.223.11.112/webrtc
+           wss /ws/publish      wss /ws/view       https://<VPS_IP>/webrtc
                   │                    │                 │
-        ┌─ 板子（192.168.2.187）────┐ │                 │
+        ┌─ 板子（<BOARD_IP>）───────┐ │                 │
         │  device_agent.py  ←───────┼─┘  主动连出去       │
         │  web_server.py    ←───────┘                    │
         │      ▲                                          │
@@ -62,7 +65,7 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 | 入口 | 页面来源 | 适合 | 鉴权 |
 |---|---|---|---|
 | `https://<板子IP>:8443/` | 板子的 `web_server.py` | 局域网，不依赖 VPS 也能看 | 无（局域网） |
-| `https://124.223.11.112/webrtc` | VPS 的 `web_server.py`（nginx 之后） | 外网 / 跨网 | HTTP Basic Auth |
+| `https://<VPS_IP>/webrtc` | VPS 的 `web_server.py`（nginx 之后） | 外网 / 跨网 | HTTP Basic Auth |
 
 信令在两种情况下都走 VPS 的 8443；媒体始终是浏览器与板子之间的 ICE 路径，
 **不经过任何一个 `web_server.py`**。
@@ -118,6 +121,16 @@ Basic Auth。
 | **信令（外网页）** | 浏览器 ⇄ VPS（443 → 8443） | 页面本身就来自 VPS，同源；由 nginx 终结 TLS |
 | **控制（局域网页）** | 浏览器 ⇄ 板子（本地 unix socket） | **不经过 VPS**，见第五节 |
 | **控制（外网页）** | — | VPS 上没有 `device_agent` 的 unix socket，`/camera` 明确返回 502，页面不显示切换按钮 |
+
+### VPS 自签证书（`vps-self.crt`）
+
+`certs/vps-self.crt` 是 VPS 自签名证书的公钥副本，仓库里没有生成它的脚本。
+
+- **源文件**：VPS 上的 `/etc/nginx/ssl/self.crt`，由 nginx 在 443 上使用；私钥是同目录的
+  `self.key`（`root:root 600`），只留在 VPS 上。
+- **用途**：板子和验收工具通过 `--tls-ca` / `--cafile` 把它当信任锚。
+- **属性**：自签（`CN=<VPS_IP>`）、RSA 2048、10 年有效期、`CA:TRUE`、SAN 里是 IP。
+- **轮换**：换 IP 或私钥时重新签一张，把新的 `.crt` 手动放到每台机器的 `certs/` 下。
 
 ### 为什么信令要绕板子一手
 
@@ -177,7 +190,7 @@ web/
 
 tools/
   run-agent.sh run-web.sh     起服务
-  gen_cert.sh deploy_vps.sh   证书 / 部署
+  gen_cert.sh deploy_vps.sh   板子证书 / 部署（VPS 那张自签证书是手工签的，见第二节）
   deploy_web_vps.sh           VPS 上的观看页服务 + nginx 路由
   analyze_diag.py             **主验收**：13 条（视频）、17 条（含音频）或 22 条（含遥操作）判据
   check_switch.sh             切换摄像头那组 13 条判据
@@ -477,7 +490,7 @@ ADC 起振瞬态、设备 busy、整数秒对齐 —— 任何一个都会把结
 ```bash
 # 主验收：13 条（视频）、17 条（含双向音频）或 22 条（含遥操作）
 python3 tools/analyze_diag.py --url https://<信令服务器> --room <房间> \
-        --cafile vps-self.crt --audio --teleop --teleop-expect-nack
+        --cafile certs/vps-self.crt --audio --teleop --teleop-expect-nack
 
 # 切换摄像头：13 条（设备侧证明"那一段真的换了"，浏览器侧证明"解出来的是新画面"）
 tools/check_switch.sh --base https://<板子>:8443
@@ -521,14 +534,29 @@ WS 根本没连上、会话压根没建起来，那么"断开之后 0 个"是白
 
 ### 局域网（最小形态，不需要 VPS）
 
-```bash
-# 板子上
-tools/run-agent.sh                 # device_agent.py，推流
-tools/run-web.sh                   # web_server.py + 页面（8443）
+`run-agent.sh` / `run-web.sh` 是为当前公网部署写的：它们要求 `.env` 里的
+`SIGNAL_HOST` / `SIGNAL_AUTH` 指向 VPS。**纯局域网**时直接起三个进程：
 
-# 浏览器
-https://<板子IP>:8443/?room=<房间>
+```bash
+bash tools/gen_cert.sh                     # 浏览器麦克风需要安全上下文
+
+# 1) 信令（板子上，8080 明文；局域网不需要 STUN/TURN）
+python3 src/signal_server.py --room demo --token hunter2 --ice-mode none --port 8080
+
+# 2) 推流端
+python3 src/device_agent.py --signal ws://127.0.0.1:8080/ws/publish \
+    --room demo --token hunter2            # 没有麦克风就加 --no-audio
+
+# 3) 页面 + 同源代理（切换摄像头的按钮依赖这一步）
+python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080 \
+    --tls-cert certs/board.crt --tls-key certs/board.key
 ```
+
+浏览器打开 `https://<板子IP>:8443/`；房间号由 `/config.json` 自动提供，
+不用手写 `?room=`。
+
+只跑 `signal_server.py` 也能出画面（它自己在 `/` 提供页面），但没有 `/camera`
+代理，页面上不会出现切换摄像头的按钮。
 
 ### 公网（当前部署形态）
 

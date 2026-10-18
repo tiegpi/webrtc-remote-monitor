@@ -39,7 +39,7 @@ exec python3 src/web_server.py \
     --room "$ROOM" \
     --signal "https://$SIGNAL_HOST" \
     --signal-auth "$SIGNAL_AUTH" \
-    --tls-ca vps-self.crt \
+    --tls-ca certs/vps-self.crt \
     --tls-cert certs/board.crt \
     --tls-key certs/board.key \
     "$@"
