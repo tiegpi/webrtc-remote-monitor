@@ -14,6 +14,10 @@ DeviceSession，只是把信令换成一个内存里的假 send_fn —— 所以
         bash -lc 'cd ~/webrtc-remote-monitor && python3 tools/check_offer.py'
 
     --expect-audio   没有音频 m-line 就非零退出，给脚本/CI 用
+    --expect-datachannel
+                     没有 m=application / a=sctp-port 就非零退出。这是阶段三
+                     的 SCTP spike：先证明板子愿意协商 DataChannel，再去谈
+                     命令和回执
     --no-camera-wb   不挂白平衡桥（快一点，图像会偏绿，但 offer 不受影响）
 
 注意它会**真的占用摄像头和麦克风**，跑之前先把正在推流的 device_agent 停掉。
@@ -48,7 +52,7 @@ log = logging.getLogger("checkoffer")
 BASE_ARGV = ["--gop", "10", "--camera-wb", "auto"]
 
 
-async def amain(args, timeout, expect_audio):
+async def amain(args, timeout, expect_audio, expect_dc):
     loop = asyncio.get_running_loop()
     got = {"offer": None, "cands": 0}
 
@@ -80,25 +84,42 @@ async def amain(args, timeout, expect_audio):
     if settle:
         await asyncio.sleep(settle)
 
-    rc = report(got, expect_audio)
+    rc = report(got, expect_audio, expect_dc)
     log.info("板端统计: %s", sess.counters())
     sess.stop()
     return rc
 
 
-def report(got, expect_audio):
+def report(got, expect_audio, expect_dc):
     sections = split_m_sections(got["offer"])
     log.info("=" * 66)
     log.info("offer 共 %d 节，ICE 候选 %d 条", len(sections), got["cands"])
     log.info("=" * 66)
 
     found_audio = False
+    found_dc = False
     for i, sec in enumerate(sections):
         direction, pt, codecs = describe(sec)
         kind = media_kind(sec)
         log.info("[%d] %s", i, sec["m"])
         log.info("      方向 = %s   PT = %s   编码 = %s",
                  direction, pt, ", ".join(codecs) or "（没写 rtpmap）")
+
+        if kind == "application":
+            found_dc = True
+            # DataChannel 不是 RTP：它走 SCTP over DTLS，所以 a=sctp-port 才是
+            # "这一节真的能承载通道"的标志。只有 m=application 而缺它，浏览器
+            # 会建出一个一直停在 connecting 的 PeerConnection。
+            port = ""
+            for a in sec["attrs"]:
+                if a.startswith("a=sctp-port:"):
+                    port = a.split(":", 1)[1].strip()
+                    break
+            if port:
+                log.info("      SCTP 端口 = %s（DataChannel 可以协商）", port)
+            else:
+                log.error("      !! 有 m=application 但没有 a=sctp-port —— "
+                          "这一节浏览器不会建出 DataChannel")
 
         if kind == "audio":
             found_audio = True
@@ -117,21 +138,33 @@ def report(got, expect_audio):
                 log.error("      !! inactive = 这一路被关掉了")
 
     log.info("-" * 66)
+    rc = 0
+
     if found_audio:
         log.info("音频 m-line 在。**但方向是 sendrecv 只说明板子愿意收也愿意发**；"
                  "浏览器的麦克风能不能上来，还要看页面的 addTrack 有没有在 "
                  "setRemoteDescription 之前做完（那一步在浏览器侧，这里测不到）。")
-        return 0
-
-    if expect_audio:
+    elif expect_audio:
         log.error("没有音频 m-line，而 --expect-audio 要求必须有。")
         log.error("板子上常见的两个原因：")
         log.error("  1) 启动日志里报了 AudioUnavailable（3.5mm 插的是三极耳机，"
                   "又没有 USB 采集卡）→ 跑 tools/check_audio.sh 看硬件")
         log.error("  2) 传了 --no-audio")
-        return 1
-    log.warning("没有音频 m-line（板子在做纯视频，阶段一的行为）。")
-    return 0
+        rc = 1
+    else:
+        log.warning("没有音频 m-line（板子在做纯视频，阶段一的行为）。")
+
+    if found_dc:
+        log.info("DataChannel m-line 在。这证明 webrtcbin 愿意协商 SCTP；"
+                 "通道本身能不能打开、命令能不能来回，由 tools/selftest.py 验。")
+    elif expect_dc:
+        log.error("没有 m=application，而 --expect-datachannel 要求必须有。")
+        log.error("常见原因：")
+        log.error("  1) create-data-channel 在 create-offer **之后**才调 —— "
+                  "通道不会出现在这份 SDP 里")
+        log.error("  2) create-data-channel 返回了 None（日志里有一行 ERROR）")
+        rc = 1
+    return rc
 
 
 def main(argv=None):
@@ -143,6 +176,8 @@ def main(argv=None):
                    help="等 offer 的秒数")
     p.add_argument("--expect-audio", action="store_true",
                    help="没有音频 m-line 就非零退出")
+    p.add_argument("--expect-datachannel", action="store_true",
+                   help="没有 m=application / a=sctp-port 就非零退出")
     p.add_argument("--no-camera-wb", action="store_true",
                    help="不挂白平衡桥，省几秒")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -182,7 +217,8 @@ def main(argv=None):
     glib_loop = GLib.MainLoop()
     threading.Thread(target=glib_loop.run, name="glib-main", daemon=True).start()
     try:
-        return asyncio.run(amain(args, known.timeout, known.expect_audio))
+        return asyncio.run(amain(args, known.timeout, known.expect_audio,
+                                 known.expect_datachannel))
     except KeyboardInterrupt:
         return 130
     finally:

@@ -23,7 +23,9 @@ GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能�
 """
 
 import asyncio
+import json
 import logging
+import time
 
 import gi
 
@@ -38,6 +40,7 @@ from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 import pipeline
 import sources
+import teleop
 
 log = logging.getLogger("session")
 
@@ -70,6 +73,25 @@ class DeviceSession:
         self.audio_elements = None       # 回程链（浏览器→扬声器），建好前是 None
         self.stopped = False
 
+        # 遥操作（阶段三）。DataChannel 是**板子**建的，浏览器只负责应答；
+        # 命令走 DC，回执也走 DC —— 不经过信令服务器。
+        self.dc = None
+        self.overlay = None              # 当前采集段里的 textoverlay
+        self._dc_handlers = []           # (signal, handler_id)，stop() 里摘掉
+        self._overlay_token = 0          # 旧定时器靠它自动失效
+        self._negotiating = False        # 防重复的 negotiation-needed
+        self._offer_created = False      # 本方案只发一次 offer
+
+        # 遥操作的板端计数。读它们的是 1Hz 遥测和 tools/analyze_diag.py。
+        # 写的人是 GLib 主线程上的 DC 回调，读的人是 asyncio 线程 ——
+        # 都是普通 int/str，GIL 下足够，不要在这里加锁。
+        self.n_teleop_rx = 0
+        self.n_teleop_ack = 0
+        self.n_teleop_nack = 0
+        self.n_teleop_overlay = 0
+        self.last_teleop_seq = None
+        self.last_teleop_cmd = None
+
         # 统计量。读它们的是 1Hz 遥测和 tools/analyze_diag.py。
         # RTP 包在**探针回调里**计数，那个回调跑在 streaming 线程上，
         # 所以这里只做自增，不做任何分配或加锁。
@@ -91,6 +113,10 @@ class DeviceSession:
         self.pipeline, self.webrtcbin, self.switch = pipeline.build(
             self.args, self.ice, log, self.source,
             on_audio_elements=self._on_audio_elements)
+
+        # 叠加层在当前采集段那个 bin 里。换摄像头时整段会重建，
+        # 所以 switch_source() 里必须再绑一次（见那里的 finally）。
+        self._bind_overlay()
 
         # 顺序有讲究：先接 on-ice-candidate / on-negotiation-needed，
         # 再 set_state(PLAYING)。反过来的话首次协商会因为没人接
@@ -126,6 +152,25 @@ class DeviceSession:
         if self.stopped:
             return
         self.stopped = True
+
+        # 遥操作收尾：让 2 秒清空定时器失效，摘掉 DC 回调，再放掉引用。
+        # 顺序在拆 pipeline 之前 —— 通道对象属于 webrtcbin，拆完再碰它就是在
+        # 摸一个已经析构的 GObject。
+        self._overlay_token += 1
+        self.overlay = None
+        if self.dc is not None:
+            for sig, hid in self._dc_handlers:
+                try:
+                    self.dc.disconnect(hid)
+                except Exception:            # noqa: BLE001
+                    pass
+            self._dc_handlers = []
+            try:
+                self.dc.disconnect_by_func(self._on_dc_message)
+            except Exception:                # noqa: BLE001
+                pass
+            self.dc = None
+
         if self.pipeline is not None:
             # 先 NULL 再收桥线程：NULL 会把 appsrc flush 掉，卡在满队列上的
             # push_buffer 立刻返回，线程不用等超时。
@@ -173,9 +218,15 @@ class DeviceSession:
             # 还没有会话（没有观看端）时只记住选择，等建 pipeline 时用它。
             self.source = sources.resolve(name)
             return self.source.name
-        applied = self.switch.switch(name)
-        self.source = self.switch.source
-        return applied
+        try:
+            applied = self.switch.switch(name)
+            self.source = self.switch.source
+            return applied
+        finally:
+            # 换源会重建整个采集段 bin，旧的 textoverlay 跟着销毁。
+            # 不重绑的话：命令照常 ACK、计数照常涨，画面里却再也不出字 ——
+            # 这是最像"链路还活着"的一种坏法，必须在这里收掉。
+            self._bind_overlay()
 
     # ---------------- 统计探针 ----------------
     def _attach_counters(self):
@@ -291,6 +342,15 @@ class DeviceSession:
             "audio_packets_out": self.n_audio_packets_out,
             "audio_bytes_out": self.n_audio_bytes_out,
             "audio_frames_decoded": self.n_audio_frames_decoded,
+            # 遥操作：浏览器侧的 sent/acked 是"页面记的账"，这几个是板子记的账。
+            # 两边的数对得上，才说明回执不是页面自己编的。
+            "teleop_dc_state": self._dc_state(),
+            "teleop_rx": self.n_teleop_rx,
+            "teleop_ack": self.n_teleop_ack,
+            "teleop_nack": self.n_teleop_nack,
+            "teleop_overlay": self.n_teleop_overlay,
+            "teleop_last_seq": self.last_teleop_seq,
+            "teleop_last_cmd": self.last_teleop_cmd,
         }
 
     # ---------------- GStreamer 总线 ----------------
@@ -348,17 +408,44 @@ class DeviceSession:
 
     # ---------------- 协商 ----------------
     def _on_negotiation_needed(self, element):
+        # 只发一次 offer，全程不重协商。create-data-channel 有时会再触发一次
+        # negotiation-needed；没有这道闸门就会发出第二个 offer，而页面按
+        # "单次协商"设计，收到第二个只会重建整个 PeerConnection。
+        if self._negotiating or self._offer_created:
+            log.debug("协商已在进行或已完成，忽略重复的 negotiation-needed")
+            return
+        self._negotiating = True
+
+        # **DataChannel 必须在 create-offer 之前建**，否则不会写进这份 SDP。
+        # 这一步能走到就说明 pipeline 已经 PLAYING 了 —— 更早调用时
+        # create-data-channel 会静默返回 None（只在日志里留一行 assertion）。
+        if self.dc is None:
+            try:
+                self.dc = element.emit("create-data-channel", "teleop", None)
+            except Exception:                # noqa: BLE001
+                log.exception("create-data-channel 抛异常")
+                self.dc = None
+            if self.dc is None:
+                log.error("create-data-channel 返回 None —— 遥操作通道不可用。"
+                          "音视频照常协商，但画面不会出命令字、页面收不到 ACK")
+            else:
+                log.info("已创建 DataChannel（label=%s，初始状态=%s）",
+                         self.dc.get_property("label"), self._dc_state())
+                self._wire_datachannel()
+
         log.info("需要协商，创建 offer…")
         promise = Gst.Promise.new_with_change_func(self._on_offer_created, element, None)
         element.emit("create-offer", None, promise)
 
     def _on_offer_created(self, promise, element, _user_data):
         promise.wait()
+        self._negotiating = False
         reply = promise.get_reply()
         offer = reply.get_value("offer")
         if offer is None:
             log.error("create-offer 返回空")
             return
+        self._offer_created = True
 
         promise = Gst.Promise.new()
         element.emit("set-local-description", offer, promise)
@@ -367,6 +454,127 @@ class DeviceSession:
 
         log.info("offer 已生成并下发")
         self._send_threadsafe({"type": "offer", "sdp": offer.sdp.as_text()})
+
+    # ---------------- 遥操作：DataChannel + 画面叠加 ----------------
+    def _bind_overlay(self):
+        """把 self.overlay 指向**当前**采集段里的 textoverlay。
+
+        换摄像头会重建整段采集链，旧元素随旧 bin 一起销毁。只在 start() 里绑
+        一次的话，切换之后命令仍会 ACK（DC 还在），画面却不再出字。
+        """
+        self.overlay = (self.pipeline.get_by_name("teleop")
+                        if self.pipeline is not None else None)
+        if self.pipeline is not None and self.overlay is None:
+            log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
+
+    def _dc_state(self):
+        if self.dc is None:
+            return None
+        try:
+            return self._nick(self.dc.get_property("ready-state"))
+        except Exception:                    # noqa: BLE001
+            return None
+
+    def _wire_datachannel(self):
+        """连接 DC 的信号。这个对象只属于 GLib 主线程，回调也在那里跑。"""
+        for sig, handler in (("on-open", self._on_dc_open),
+                             ("on-close", self._on_dc_close),
+                             ("on-error", self._on_dc_error)):
+            try:
+                self._dc_handlers.append((sig, self.dc.connect(sig, handler)))
+            except TypeError:
+                log.warning("DataChannel 上没有 %s 信号（版本差异？）", sig)
+        try:
+            used = teleop.connect_message(self.dc, self._on_dc_message)
+            log.info("DataChannel 消息信号：%s", used)
+        except RuntimeError as exc:
+            log.error("DataChannel 收不到消息：%s", exc)
+
+    def _on_dc_open(self, channel):
+        log.info("DataChannel 已打开（label=%s），可以接收遥操作命令",
+                 channel.get_property("label"))
+
+    def _on_dc_close(self, _channel):
+        log.warning("DataChannel 已关闭")
+
+    def _on_dc_error(self, _channel, error):
+        log.error("DataChannel 错误：%s", getattr(error, "message", error))
+
+    def _on_dc_message(self, _channel, payload):
+        """收到一条命令。**绝不能在这里 create-data-channel**：webrtcbin 持着
+        同一把锁，会死锁。"""
+        t0 = time.monotonic()
+        self.n_teleop_rx += 1
+        try:
+            msg = teleop.validate(teleop.parse(payload))
+        except teleop.ProtocolError as exc:
+            self.n_teleop_nack += 1
+            log.warning("遥操作命令被拒：%s（seq=%r，cmd=%r）",
+                        exc.reason, exc.seq, exc.cmd)
+            self._dc_send(teleop.nack_from(exc))
+            return
+        except Exception:                    # noqa: BLE001
+            # malformed 输入不能打崩会话，也不能静默 —— 明确回 internal。
+            log.exception("遥操作消息处理失败")
+            self.n_teleop_nack += 1
+            self._dc_send(teleop.nack(None, None, None, "internal"))
+            return
+
+        self.last_teleop_seq = msg["seq"]
+        self.last_teleop_cmd = msg["cmd"]
+        self._show_overlay(msg)
+        self.n_teleop_ack += 1
+        ms = (time.monotonic() - t0) * 1000.0
+        log.info("遥操作 #%d %s%s -> 已叠加（板端 %.1f ms）",
+                 msg["seq"], msg["cmd"],
+                 "" if msg.get("arg") is None else " %d" % msg["arg"], ms)
+        self._dc_send(teleop.ack(msg["seq"], msg["cmd"], msg["ts"], ms))
+
+    def _show_overlay(self, msg):
+        """把命令写在画面左上角，2 秒后清空。
+
+        这是整条回路的**唯一硬证据**：文字只能由板子产生。序号和时间戳
+        让旧帧伪装不成一次新的执行。
+        """
+        el = self.overlay
+        if el is None:
+            return
+        now = time.time()
+        when = "%s.%d" % (time.strftime("%H:%M:%S", time.localtime(now)),
+                          int(now * 10) % 10)
+        el.set_property("text",
+                        teleop.overlay_text(msg["seq"], msg["cmd"],
+                                            msg.get("arg"), when))
+        self.n_teleop_overlay += 1
+
+        # token 而不是 source_remove：命令来得比 2 秒快时，旧定时器醒来后
+        # 发现自己已经不是最新的，直接收工，不会把新消息提前清掉。
+        self._overlay_token += 1
+        token = self._overlay_token
+
+        def clear():
+            if token != self._overlay_token:
+                return GLib.SOURCE_REMOVE
+            target = self.overlay
+            if target is not None:
+                target.set_property("text", "")
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(2000, clear)
+
+    def _dc_send(self, obj):
+        """发回执。通道没开就返回 False —— 不抛异常，也不假装发了。"""
+        if self.dc is None:
+            return False
+        if self._dc_state() != "open":
+            return False
+        try:
+            self.dc.emit("send-string",
+                         json.dumps(obj, ensure_ascii=True, separators=(",", ":")))
+        except Exception:                    # noqa: BLE001
+            log.exception("DataChannel 发送失败：%r", obj)
+            return False
+        return True
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
         self._send_threadsafe({
