@@ -195,10 +195,16 @@ webrtcbin.src_%u → queue name=rq ! rtpopusdepay ! opusdec !
   ```python
   if self.dc is None:
       self.dc = self.webrtcbin.emit("create-data-channel", "teleop", None)
-      self.dc.connect("on-message", self._on_command)
+      teleop.connect_message(self.dc, self._on_dc_message)
   self.webrtcbin.emit("create-offer", None, promise)
   ```
-- **不能在 `on-message` 回调里再 `create-data-channel`** —— webrtcbin 持同一把锁，会**死锁**。
+- **信号名不是 `on-message`**（2026-10-18 实测）：GStreamer 1.20.3 的
+  `libgstwebrtc-1.0.so.0` 里只有 `on-message-string` / `on-message-data` /
+  `on-open` / `on-close` / `on-error` / `on-buffered-amount-low`。所以用
+  `teleop.connect_message()` 按 string → data → message 顺序尝试，并把实际连上的
+  名字打进日志。写成 `connect("on-message", ...)` 只会在 stderr 留一行 "no signal"，
+  然后命令永远收不到。
+- **不能在消息回调里再 `create-data-channel`** —— webrtcbin 持同一把锁，会**死锁**。
 - 浏览器侧必须用 `pc.ondatachannel`（通道是**板子**建的），**且要在 `setRemoteDescription`
   之前**挂好；挂晚了第一个通道就丢了。
 - **只发一次 offer，全程不重协商。** 这是整个简化方案成立的关键。
@@ -221,8 +227,10 @@ webrtcbin.src_%u → queue name=rq ! rtpopusdepay ! opusdec !
 收到命令后把 `textoverlay` 的 text 改成：
 
 ```
-CMD #7 FORWARD 12:00:01.2
+CMD #7 FORWARD 12  14:32:05.1
 ```
+
+（`序号 命令 arg 时刻`，时刻是 `HH:MM:SS.s`，纯 ASCII —— 板子上没有中文字体。）
 
 2 秒后清空。这段文字**只能由板子产生**，所以它在画面里出现，同时证明了两件事：
 命令走通了 DataChannel，以及视频链路是活的。带序号和时间戳是为了让旧帧伪装不成新执行。
@@ -243,24 +251,35 @@ CMD #7 FORWARD 12:00:01.2
 
 ### 验证怎么搭：复用现成的，不引入新基础设施
 
-宿主机上**没有** headless 浏览器（无 chrome / chromium / playwright / node），
+宿主机（WSL）上**没有** headless 浏览器（无 chrome / chromium / playwright / node），
 `tools/gop_sweep.sh` 用的就是"人开着浏览器 + 脚本轮询 `/diag`"这个模式。阶段三沿用：
 
 - 页面把遥操作统计塞进**已有的 1Hz diag 样本**里：
   `{sent, acked, p50Rtt, p95Rtt, lastAckSeq, lastCmd}`
 - `analyze_diag.py` 加判据断言全部 ACK 且 p95 RTT < 300ms
 
-**可选加分项**：`tools/selftest.py` —— 无头 GStreamer 对端（webrtcbin 应答，
-靠 `on-data-channel` 收板子建的通道），发 N 条命令读 ACK。
-好处是**没人开浏览器时也能自动跑**，适合放进 CI 或提交前的自检。
+**加分项（已实现）**：`tools/selftest.py` —— 无头 GStreamer 对端（webrtcbin 应答，
+靠 `on-data-channel` 收板子建的通道），发 N 条命令读 ACK。好处是**没人开浏览器时
+也能自动跑**，适合放进 CI 或提交前的自检。它顺带把"GStreamer 当 answerer 会不会
+答 SCTP"这件事实测掉了（会；而且通道交给回调时已经是 open）。
+
+真正开浏览器那条路，WSL 里也可以调 Windows 的 Chrome：
+`/mnt/c/Program Files/Google/Chrome/Application/chrome.exe --headless=new
+--dump-dom --virtual-time-budget=60000 <url>`。注意 `--virtual-time-budget` 会让
+页面里的 `performance.now()` 和 `getStats()` 时间一起"快进"，测出来的 RTT / 帧率
+不可当真（实测 p95 879ms，而板端处理耗时只有 0.2ms）—— 它只适合验"流程走通"，
+不适合验性能。用这个方法还需要把探针脚本附到页面副本上，跑完把副本删掉。
 
 ### 判据
 
 | 新判据 | 防的是什么 |
 |---|---|
-| 每条命令都有 ACK（`acked == sent`，无缺号） | 丢一条就是丢一个操作 |
+| 每条命令都有回执（`sent == acked + nacked`，无缺号） | 丢一条就是丢一个操作 |
+| 回执与命令一一对应（无陌生 seq、无回显不一致） | 配对逻辑坏了，链路却是通的 —— 最容易看成"延迟高" |
 | p95 RTT < 300ms | 遥操作的可用性底线 |
 | 白名单外的命令被拒且回 nack | 别把"静默忽略"当成"安全" |
+| 板端 `teleop_rx` / `teleop_ack` 与页面一致 | 页面自己记的数，页面自己也能全对 |
+| 板端 `teleop_overlay` 跟得上 ACK | ACK 是真的、画面那道环是假的 |
 | 人工：画面里出现 `CMD #N ...` | 唯一能证明"命令真的生效了"的证据 |
 
 ---
@@ -278,11 +297,12 @@ CMD #7 FORWARD 12:00:01.2
 5. 板端 B 路（`pad-added` → `alsasink`）。
 6. 加音频判据，跑 `analyze_diag.py`。
 
-**阶段三**
-7. `src/teleop.py` —— 白名单、分发、ACK、overlay 文案。
-8. `session.py` 建 DataChannel；`pipeline.py` 插 `textoverlay`。
-9. 页面加命令输入框 + 回执日志 + teleop 统计上报。
-10. 加遥操作判据；可选写 `tools/selftest.py`。
+**阶段三**（全部完成）
+7. ✅ `src/teleop.py` + `tools/check_teleop.py` —— 白名单、校验、ACK/NACK、overlay 文案，宿主机单测。
+8. ✅ `pipeline.py` 插 `textoverlay` + `tools/check_textoverlay.py`（三种采集组合实测帧率）；
+   `session.py` 建 DataChannel + `tools/check_offer.py --expect-datachannel`（SCTP spike）。
+9. ✅ 页面命令台 + 回执统计 + teleop diag 块；`tools/selftest.py` 无头对端收发命令。
+10. ✅ `analyze_diag.py --teleop` 共 22 条判据。
 
 ---
 
@@ -304,7 +324,7 @@ CMD #7 FORWARD 12:00:01.2
 | **画面还是暗** | 阶段一遗留的硬件天花板：MIPI 这条路增益+曝光双顶格才 Y≈78（同房间 USB 摄像头是 226）。音视频都通了画面也不会变亮，只能加光或换摄像头。**演示时先解释这句**，否则会被当成链路问题。 |
 | **麦克风没插** | 3.5mm 口上现在是三极耳机。不换四极耳麦就得用 USB 麦克风 —— 见第二节。 |
 | `hp switch` 复位 | mixer 状态若重启复位，启动脚本里要带上。 |
-| `textoverlay` + `appsrc` 是新组合 | 阶段一没有 textoverlay，阶段二才加桥。这条要单独验协商，别假设能用。 |
+| ~~`textoverlay` + `appsrc` 是新组合~~ | 已用 `tools/check_textoverlay.py` 在板子上验过 mipi（±wb）与 usb 三种组合：caps 协商通过，改文字不打断码流。 |
 | gop 还没定 | 现在靠命令行传 `--gop 10`，`tools/run-agent.sh` 里没有。裸跑会退回默认 60。**这个值要拍板**。 |
 | 帧率数字对不上 | 同样 gop=10，判据测到 19.7fps，画质修完的健康检查测到 29.3fps。**没有结论**，别当事实用。 |
 
@@ -312,12 +332,12 @@ CMD #7 FORWARD 12:00:01.2
 
 ## 八、交付物清单
 
-- [ ] `tools/check_audio.sh` + `tools/gen_cert.sh`
+- [x] `tools/check_audio.sh` + `tools/gen_cert.sh`
 - [x] `tools/run-web.sh`（带 TLS 启动观看页服务）+ `tools/run-agent.sh`
-- [ ] `src/teleop.py`
-- [ ] `src/pipeline.py` 音频分支 + `textoverlay`
-- [ ] `src/session.py` 音频回程 + DataChannel
-- [ ] `web/monitor.html` 对讲 + 命令台（记得动 `PAGE_VERSION`）
-- [ ] `tools/analyze_diag.py` 新增判据
-- [ ] `tools/selftest.py`（可选）
-- [x] **`docs/architecture.md`** —— 原始需求第 3 条，已交付（阶段三那一节等做完再补）
+- [x] `src/teleop.py` + `tools/check_teleop.py`（协议单测，宿主机可跑）
+- [x] `src/pipeline.py` 音频分支 + `textoverlay`（+ `tools/check_textoverlay.py`）
+- [x] `src/session.py` 音频回程 + DataChannel（+ `check_offer.py --expect-datachannel`）
+- [x] `web/monitor.html` 对讲 + 命令台（`PAGE_VERSION` = `2026-10-18.1`）
+- [x] `tools/analyze_diag.py` 新增判据（`--teleop`）
+- [x] `tools/selftest.py`（无头对端，收发命令 + `--auth`）
+- [x] **`docs/architecture.md`** —— 原始需求第 3 条，阶段三一节已补（第五节 + 第六节线程模型不变）

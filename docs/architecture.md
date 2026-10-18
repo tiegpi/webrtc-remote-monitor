@@ -14,9 +14,7 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 - 看到板子上的实时画面（硬件编码的 H.264，720p）
 - 听到板子上的声音，也能对着板子说话（双向语音）
 - 在页面上切换用哪个摄像头
-
-**遥操作（阶段三）还没做**，设计在 `PLAN-phase2-3.md` 里。本文档里凡涉及阶段三的地方
-都会明确标出来。
+- 往输入框里打一条命令，板子"执行"后**画面左上角出现这行字**，同时收到回执
 
 三个阶段刻意做成**各自独立可跑、可演示、可提交**：阶段一只有视频，阶段二加上语音，
 阶段三加上遥操作。每一步都能单独验收，不必等下一步。
@@ -26,7 +24,7 @@ Orange Pi 5（RK3588）上接了一个 MIPI 摄像头和一个 USB 摄像头，�
 | 一 | 视频：摄像头 → H.264 → WebRTC → 浏览器 | 已交付 |
 | 二 | 语音：双向（板子麦克风 → 浏览器；浏览器麦克风 → 板子扬声器） | 已交付 |
 | 二·补 | 双摄像头 + 页面切换 | 已交付 |
-| 三 | 遥操作：浏览器打字 → 板子"执行"→ **画面里出现这行字** + 回执 | 未实现，设计见 `PLAN-phase2-3.md` |
+| 三 | 遥操作：浏览器打字 → 板子"执行"→ **画面里出现这行字** + 回执 | 已交付 |
 
 ---
 
@@ -172,6 +170,7 @@ src/
   web_server.py     页面服务 + 同源代理（/ws/view、/ice.json、/diag、/camera）
   signal_server.py  信令服务器（局域网跑在板子上，公网跑在 VPS 上，同一个文件）
   sdpview.py        把 SDP 读成人话（板子和工具共用）
+  teleop.py         遥操作协议：白名单、校验、ACK/NACK、叠加文案（纯标准库）
 
 web/
   monitor.html      整个观看页：一个文件，没有构建步骤
@@ -180,9 +179,11 @@ tools/
   run-agent.sh run-web.sh     起服务
   gen_cert.sh deploy_vps.sh   证书 / 部署
   deploy_web_vps.sh           VPS 上的观看页服务 + nginx 路由
-  analyze_diag.py             **主验收**：13 条（视频）或 17 条（含音频）判据
+  analyze_diag.py             **主验收**：13 条（视频）、17 条（含音频）或 22 条（含遥操作）判据
   check_switch.sh             切换摄像头那组 13 条判据
   check_fd.sh                 会话拆除后设备 fd 有没有还回去
+  check_teleop.py             遥操作协议单测（宿主机，无 GStreamer）
+  check_textoverlay.py        textoverlay 三种采集组合的帧率实测（板子）
   check_audio.sh check_offer.py selftest.py turn_check.py freeze_stats.py …
                              单项排查工具
 ```
@@ -240,7 +241,11 @@ MIPI（OV13850）在**这块板子上**是弱势的一方，因为板子上**没
 
 ---
 
-## 五、控制通道：切摄像头
+## 五、控制通道：切摄像头与遥操作
+
+这一节讲两条控制链路。它们看起来都是在"遥控板子"，但**载体完全不同**，原因是
+两者的约束不同：切摄像头是低频、局域、可以等一个 HTTP 往返；遥操作是高频、
+外网也要用、每条都要回执。
 
 ### 为什么不走信令
 
@@ -289,6 +294,79 @@ VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 u
 例如 `ssh -R /run/webrtc-web/agent.sock:<板子上的 agent.sock> ...`，
 再把 VPS 上 web_server 的 `--agent-socket` 指过去。这和"板子零入站端口"的
 原则一致，但它引入一条新的长期 SSH 信任链，所以没有默认做。
+
+### 遥操作走 DataChannel，不走上面那条 HTTP 路
+
+命令要低延迟，且每条都要一个明确的回执 —— HTTP 每条一个往返、还要再做一套轮询
+取回执。WebRTC 连接和 DTLS 已经建好了，DataChannel 只是在同一连接里多一条
+`m=application`，不用新端口、不改信令白名单，而且天然穿 NAT / TURN，外网也能用。
+
+代价在时序上：**通道必须在 `create-offer` 之前创建**，GStreamer 只在那时把
+`m=application` 写进 SDP；本项目又只发一次 offer、不重协商，所以一个会话只有一条
+通道。`create-data-channel` 早了（pipeline 还没到 PLAYING）会**静默返回 None**，
+所以它放在 `_on_negotiation_needed` 里、紧挨 `create-offer` 之前，并加了闸门防止
+反过来再触发一次协商。反过来，在 `on-message` 回调里建通道会和 webrtcbin 抢同一把锁，
+**直接死锁**。
+
+### 命令协议
+
+```
+浏览器 → 板子   {"t":"cmd","seq":7,"cmd":"FORWARD","arg":12,"ts":1728...}
+板子 → 浏览器   {"t":"ack","seq":7,"cmd":"FORWARD","ts":...,"ms":3.2}
+                {"t":"nack","seq":7,"cmd":"BOGUS","reason":"unknown-command"}
+```
+
+白名单 `FORWARD` / `BACK` / `LEFT` / `RIGHT` / `STOP` / `SPEED`（`SPEED` 必须带
+`arg`，范围 -1000..1000）。超过 4096 字节的消息先拒。**每种拒绝都有具体 reason**：
+`too-large` / `bad-json` / `bad-type` / `bad-seq` / `bad-cmd` / `unknown-command` /
+`bad-ts` / `missing-arg` / `bad-arg` / `internal`。页面按 reason 归类计数 ——
+因为"命令被拒"和"命令丢了"必须能分开看，这两种现象的处理方式完全不同。
+
+板子的 `_on_dc_message` 只做三件事：校验 → 改 overlay 文字 → 回 ack（带板端处理
+耗时）。任何异常都回 `nack(reason="internal")`，**malformed 输入打不崩会话**。
+
+### 为什么强制文字出现在画面上
+
+命令的"执行"是模拟的（没有电机）。如果只看 ACK，"命令走通了"就只是板子自己的一面
+之词。文字由板子产生、经 H.264 编进画面再回到浏览器，所以**画面里出现这行字**
+同时证明了两件事：DataChannel 真的通了，视频链路也还活着。
+
+文案是 ASCII：`CMD #7 FORWARD 12  14:32:05.1`，2 秒后清空。带序号和时间戳是为了
+让旧帧伪装不成新执行。
+
+### 叠加层插在哪、为什么换摄像头后要重绑
+
+`textoverlay` 插在采集段描述的**最前面**（所有源和编码器之间）：
+
+```
+不开 wb:  v4l2src ! caps ! textoverlay ! mpph264enc ! ...
+开  wb:  ... appsrc ! caps ! textoverlay ! mpph264enc ! ...
+```
+
+这样开不开 `--camera-wb` 走同一个位置，且它直接吃 UYVY / NV12，不需要
+`videoconvert`。`wait-text=false` 必须显式设 —— 默认 true 时没有文字，整条链
+会停在那里等文字。
+
+采集段每次切换都是**整段重建**，旧的 overlay 元素随旧段销毁。所以 `switch_source()`
+在 `finally` 里重新 `_bind_overlay()`；漏了它的症状很典型：切完摄像头命令还在 ACK，
+画面却再也不出字。
+
+### 板子上没有中文字体
+
+`fc-list :lang=zh` 是空的，`textoverlay` 用 Pango 渲染，中文会变成方框。所以叠加
+文案一律 ASCII —— 命令本来就是 ASCII，时间戳也只写 `HH:MM:SS.s`。要加中文得先装
+字体，那是部署变更，不是代码变更。
+
+### 1.20.3 上没有 `on-message` 这个信号
+
+实测 `libgstwebrtc-1.0.so.0` 里只有 `on-message-string` / `on-message-data`。
+`teleop.connect_message()` 按 string → data → message 的顺序尝试，把**实际连上的
+信号名打进日志** —— 版本差异至少会留下证据，而不是变成"消息发出去了、板子说没收到"。
+
+同一条通道的两端也要分别验：板子是 offerer（自己 `create-data-channel`），
+`tools/selftest.py` 是 answerer。实测 GStreamer 当 answerer 时会解析
+`m=application` 并触发 `on-data-channel`，而且交给回调时通道**已经是 open**
+（所以回调里必须处理"已打开"这个分支）。
 
 ---
 
@@ -390,13 +468,16 @@ ADC 起振瞬态、设备 busy、整数秒对齐 —— 任何一个都会把结
 | 字节守恒 ≈ 1.0 | 防只有单向通了却被当成双向通 |
 | 稳态窗口采样 | 防把启动斜坡算进去，量出假的 5fps |
 | `selectedCandidatePair` | 防 ICE 重启后拿着冻住的旧候选对算速率 |
+| 每条命令都有回执（`sent == acked + nacked`） | 防丢一条命令被当成"页面没发" |
+| 板端 `teleop_overlay` 跟得上 ACK | 防 ACK 是真的、画面那道环是假的 |
+| 板端 `teleop_rx` 与页面 `sent` 对得上 | 防页面自说自话（自己发的、自己记的） |
 
 ### 三个验收工具
 
 ```bash
-# 主验收：13 条（视频）或 17 条（含双向音频）
+# 主验收：13 条（视频）、17 条（含双向音频）或 22 条（含遥操作）
 python3 tools/analyze_diag.py --url https://<信令服务器> --room <房间> \
-        --cafile vps-self.crt --audio
+        --cafile vps-self.crt --audio --teleop --teleop-expect-nack
 
 # 切换摄像头：13 条（设备侧证明"那一段真的换了"，浏览器侧证明"解出来的是新画面"）
 tools/check_switch.sh --base https://<板子>:8443
