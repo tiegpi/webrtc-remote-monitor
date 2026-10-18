@@ -163,6 +163,21 @@ def segment_desc(a, src):
         head += "mppjpegdec ! "
 
     tail = (
+        # 遥操作叠加层。放在 tail 的**最前面**，mpph264enc 之前 ——
+        # 这样开不开 --camera-wb 都经过同一个元素（wb 那条路是
+        # appsrc ! caps ! 这里 ! mpph264enc）。
+        #
+        # wait-text 默认是 **true**：不显式关掉的话，在第一次 set text 之前
+        # 一帧都不往下游推 —— 症状是"加了 textoverlay 之后画面全黑"。
+        # silent=false 才是真的渲染；shaded-background 让人在亮画面上也读得清。
+        # 文字只用 ASCII：板子上没有中文字体（fc-list :lang=zh 为 0），
+        # 中文会变成一排方框。
+        # textoverlay 的 sink caps 同时吃 UYVY 和 NV12，所以 mipi 和 usb
+        # 两路都不需要 videoconvert。
+        "textoverlay name=teleop wait-text=false silent=false auto-resize=false "
+        "font-desc=\"DejaVu Sans 20\" halignment=left valignment=top "
+        "shaded-background=true deltax=16 deltay=12 ! "
+        #
         # profile/level 必须显式写。mpph264enc 默认给的是 High profile
         # (profile-level-id=640028)，浏览器多半直接拒收；写成 baseline+31
         # 得到 42c01f（Constrained Baseline 3.1），Chrome/Firefox 都认。
@@ -488,6 +503,12 @@ class VideoSegment:
         if vtail is None:
             raise RuntimeError("采集段里没有 vtail（描述串写错了？）：%s" % desc)
 
+        # 遥操作叠加层。它和采集段同生共死：换摄像头时整段重建，session 必须
+        # 重新拿一次新段里的这个元素（见 DeviceSession._bind_overlay）。
+        self.overlay = self.bin.get_by_name("teleop")
+        if self.overlay is None:
+            raise RuntimeError("采集段里没有 teleop 叠加层（描述串写错了？）：%s" % desc)
+
         # ghost 必须在**还没接进骨架**的时候建：Gst.GhostPad.new() 断言目标 pad
         # 未连接（"assertion '!gst_pad_is_linked (target)' failed"，实测）。
         # 所以顺序永远是 先 parse 出独立 bin → 再 ghost → 最后才 link 到 vpay。
@@ -561,6 +582,11 @@ class VideoSwitch:
     @property
     def source(self):
         return self.current.src if self.current is not None else None
+
+    @property
+    def overlay(self):
+        """当前采集段里的 textoverlay 元素。换段之后指向新的那个。"""
+        return self.current.overlay if self.current is not None else None
 
     def attach_first(self, src):
         """接上第一个采集段。**不** sync 状态 —— 由 session.start() 的
