@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tools/selftest.py —— 无头对端：不用浏览器，把双向音频真的跑一遍
+"""tools/selftest.py —— 无头对端：不用浏览器，把双向音频和遥操作真的跑一遍
 
 它做的事和浏览器完全一样：连信令、收 offer、回 answer、交换候选。区别只有
 一个 —— 它用 `audiotestsrc` 当"麦克风"，把解出来的音频丢给 `fakesink` 并数帧，
@@ -13,11 +13,19 @@
 setRemoteDescription 之前加进去时，浏览器照样显示"正在发送"，而板子那边
 一个帧都解不出来 —— 两边都不报错。只有把两端的计数摆在一起才看得见。
 
+阶段三又加了两件事：
+
+    C. 板子建的 DataChannel（label=teleop）能不能打开
+    D. 发过去的命令有没有逐条 ACK，白名单外的有没有 NACK，往返多少毫秒
+
     本地（WSL）跑，让它去连板子 —— 这就是"笔记本浏览器连板子"的真实拓扑：
         python3 tools/selftest.py --signal https://<SIGNAL_HOST> \\
             --room <ROOM> --tls-ca vps-self.crt --duration 20
 
     --no-send-audio   只测 A（收板子的音频），B 那一路不建
+    --no-teleop       完全不要求 DataChannel（阶段一/二的行为）
+    --teleop-count 0  只要求通道**打开**、不发命令（SCTP spike）
+    --auth USER:PASS  VPS 的 /ice.json、/diag、/ws/view 都在 Basic Auth 后面
 
 退出码：0 全过；1 判据没过；2 环境/连接问题。
 """
@@ -29,6 +37,7 @@ import logging
 import ssl
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -38,6 +47,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
 from sdpview import find as sdp_find, describe as sdp_describe  # noqa: E402
+
+import teleop  # noqa: E402
 
 import gi  # noqa: E402
 
@@ -88,6 +99,204 @@ def request_pad(element, name):
     return element.get_request_pad(name)
 
 
+#: 一轮发出去的命令。六条白名单 + 一条**必须被拒**的。
+#: BOGUS 是刻意的：只有它真的收到 nack，才证明白名单是板子在把关，
+#: 而不是页面在前端拦下来的 —— 后者在无头对端里根本测不到。
+TELEOP_ROUND = (("FORWARD", 10), ("BACK", 10), ("LEFT", 10),
+                ("RIGHT", 10), ("STOP", None), ("SPEED", 50),
+                ("BOGUS", None))
+
+#: 命令之间留的间隔。板子回执只要几毫秒，300ms 不是为了等它，
+#: 而是让 seq 在时间上分得开，出问题时一眼能看出是"某一条丢了"还是"全丢了"。
+TELEOP_SEND_INTERVAL_MS = 300
+
+#: 板端计数允许落后多少。命令走 SCTP、计数走 HTTP 遥测，两条路不同步；
+#: 严格相等会把"遥测晚了一拍"判成失败。
+TELEOP_DEVICE_LAG = 2
+
+
+class TeleopClient:
+    """板子建出来的 DataChannel 的客户端：发命令、验回执。
+
+    **方向是反的**：通道由板子（offerer）创建，这边只是在 `on-data-channel`
+    回调里接到它 —— 所以这儿没有 create-data-channel，只有 on-open 之后
+    的 send-string。浏览器那一侧也是同一条路（`pc.ondatachannel`）。
+
+    为什么不用 GstWebRTC 的高层 API：GStreamer 1.20 里 DataChannel 就是
+    一个 GObject，发消息是 emit("send-string", json)，收消息是连信号。
+    协议本身的解析/校验复用 `teleop.py` —— 和无头对端、板子是同一份代码。
+    """
+
+    def __init__(self, total, max_p95):
+        self.total = total
+        self.max_p95 = max_p95
+        self.channel = None
+        self.seen = False              # on-data-channel 触发过
+        self.label = None
+        self.opened = False
+        self.message_signal = None
+
+        self.sent = 0
+        self.expected_acks = 0         # 其中白名单内的条数
+        self.acked = 0
+        self.nacked = 0
+        self.unexpected = 0            # 回执的 seq 没见过，或同一条回了两次
+        self.echo_bad = 0              # 回执里的 cmd/ts 和发出去的不一致
+        self.wrong_verdict = 0         # 合法命令收到 NACK / BOGUS 收到 ACK
+        self.bad_reply = 0             # 回执本身不是合法 JSON
+        self.nack_reasons = {}
+        self.rtts = []
+        self.pending = {}
+        self.last_seq = 0
+        self.errors = []
+        self._source = None
+
+    # ---------------- 接通道 ----------------
+    def attach(self, channel):
+        self.seen = True
+        self.channel = channel
+        self.label = channel.get_property("label")
+        if self.label != "teleop":
+            # 不认识的通道不接，但要留痕：板子以后再加一路通道时，
+            # 这里应当多一条日志，而不是悄悄变成"遥操作没了"。
+            log.warning("板子建了一个 label=%r 的 DataChannel，不是 teleop，忽略",
+                        self.label)
+            self.errors.append("label=%r" % (self.label,))
+            return
+
+        for sig, fn in (("on-open", self._on_open),
+                        ("on-close", self._on_close),
+                        ("on-error", self._on_error)):
+            try:
+                channel.connect(sig, fn)
+            except TypeError:
+                log.warning("DataChannel 上没有 %s 信号（版本差异？）", sig)
+        try:
+            self.message_signal = teleop.connect_message(channel, self._on_message)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            self.errors.append(str(exc))
+            return
+        log.info("板子的 DataChannel 已接到（label=%s，状态=%s，消息信号=%s）",
+                 self.label, self._state(), self.message_signal)
+
+        # **可能已经打开了。** 通道是板子建的，SCTP 流先建立、再通知这边，
+        # 所以 on-data-channel 触发时 ready-state 已经是 open 的情况很常见 ——
+        # 这时等 on-open 会永远等不到，命令一条都不会发出去。
+        if self._state() == "open":
+            self._on_open(channel)
+
+    def _state(self):
+        if self.channel is None:
+            return None
+        value = self.channel.get_property("ready-state")
+        return value.value_nick if hasattr(value, "value_nick") else str(value)
+
+    def _on_open(self, _channel):
+        if self.opened:
+            return
+        self.opened = True
+        log.info("DataChannel 已打开")
+        if self.total > 0:
+            self._source = GLib.timeout_add(TELEOP_SEND_INTERVAL_MS, self._tick)
+
+    def _on_close(self, _channel):
+        log.warning("DataChannel 已关闭")
+
+    def _on_error(self, _channel, error):
+        text = getattr(error, "message", str(error))
+        log.error("DataChannel 错误：%s", text)
+        self.errors.append(text)
+
+    # ---------------- 发 ----------------
+    def _tick(self):
+        if self.channel is None or self.sent >= self.total:
+            self._source = None
+            return GLib.SOURCE_REMOVE
+        cmd, arg = TELEOP_ROUND[self.sent % len(TELEOP_ROUND)]
+        self.last_seq += 1
+        seq = self.last_seq
+        ts = time.monotonic()
+        obj = {"t": "cmd", "seq": seq, "cmd": cmd, "ts": ts}
+        if arg is not None:
+            obj["arg"] = arg
+        if cmd in teleop.COMMANDS:
+            self.expected_acks += 1
+        self.pending[seq] = {"cmd": cmd, "ts": ts, "at": ts,
+                             "expect": "ack" if cmd in teleop.COMMANDS else "nack"}
+        self.channel.emit("send-string", json.dumps(obj))
+        self.sent += 1
+        return GLib.SOURCE_CONTINUE
+
+    # ---------------- 收 ----------------
+    def _on_message(self, _channel, payload):
+        now = time.monotonic()
+        try:
+            msg = teleop.parse(payload)
+        except teleop.ProtocolError as exc:
+            self.bad_reply += 1
+            log.error("回执解析失败：%s", exc)
+            return
+        if not isinstance(msg, dict):
+            self.bad_reply += 1
+            log.error("回执不是对象：%r", type(msg))
+            return
+
+        kind = msg.get("t")
+        seq = msg.get("seq")
+        rec = self.pending.pop(seq, None) if isinstance(seq, int) else None
+        if rec is None:
+            # 重复的回执、或者根本没发过的 seq。两种都说明配对逻辑坏了，
+            # 不能只当噪音吞掉 —— "sent == acked + nacked" 会因此假成立。
+            self.unexpected += 1
+            log.warning("回执 seq=%r 不在待回执表里（重复或凭空多出来的）", seq)
+            return
+
+        if msg.get("cmd") != rec["cmd"] or msg.get("ts") != rec["ts"]:
+            self.echo_bad += 1
+            log.warning("回执回显不一致 seq=%s：cmd %r/%r，ts %r/%r", seq,
+                        msg.get("cmd"), rec["cmd"], msg.get("ts"), rec["ts"])
+
+        if kind == "ack":
+            self.acked += 1
+            rtt = (now - rec["at"]) * 1000.0
+            self.rtts.append(rtt)
+            if rec["expect"] != "ack":
+                self.wrong_verdict += 1
+                log.error("seq=%s 是白名单外的 %s，却收到了 ACK", seq, rec["cmd"])
+            else:
+                log.debug("ACK #%s %s %.1f ms（板端 %s ms）", seq, rec["cmd"], rtt,
+                          msg.get("ms"))
+        elif kind == "nack":
+            self.nacked += 1
+            reason = msg.get("reason")
+            self.nack_reasons[reason] = self.nack_reasons.get(reason, 0) + 1
+            if rec["expect"] != "nack":
+                self.wrong_verdict += 1
+                log.error("seq=%s（%s）是合法命令，却收到 NACK：%s",
+                          seq, rec["cmd"], reason)
+            elif reason != "unknown-command":
+                log.warning("BOGUS 的 nack reason 是 %r，期望 unknown-command", reason)
+        else:
+            self.bad_reply += 1
+            log.error("回执的 t=%r 不认识", kind)
+
+    # ---------------- 汇总 ----------------
+    def unanswered(self):
+        return len(self.pending)
+
+    def p95(self):
+        if not self.rtts:
+            return None
+        s = sorted(self.rtts)
+        return s[min(len(s) - 1, int(round(0.95 * (len(s) - 1))))]
+
+    def stop(self):
+        if self._source is not None:
+            GLib.source_remove(self._source)
+            self._source = None
+
+
 class Peer:
     """一个无头观看端。"""
 
@@ -106,6 +315,8 @@ class Peer:
         self.sent = {"audio_packets": 0, "audio_bytes": 0}
         self.answer_sdp = None
         self.built = set()
+        self.teleop = None if args.no_teleop else TeleopClient(
+            args.teleop_count, args.teleop_max_p95)
 
     # ---------------- 建管线 ----------------
     def start(self):
@@ -152,6 +363,11 @@ class Peer:
 
         self.webrtcbin.connect("pad-added", self._on_pad_added)
         self.webrtcbin.connect("on-ice-candidate", self._on_ice_candidate)
+        # **必须在 set-remote-description 之前挂上。** 板子的 offer 里带着
+        # m=application，通道在 answer 生效后立刻建立；挂晚了就永远收不到这次
+        # on-data-channel（板子全程不重协商，不会再有第二次）。
+        if self.teleop is not None:
+            self.webrtcbin.connect("on-data-channel", self._on_data_channel)
 
         # 这两个状态只打给人看，判据一条都不看它们 ——
         # ice-connection-state 报 connected 而实际零媒体，是踩过的坑。
@@ -175,6 +391,10 @@ class Peer:
         value = element.get_property(pspec.name)
         log.info("[%s] %s", pspec.name, value.value_nick
                  if hasattr(value, "value_nick") else value)
+
+    def _on_data_channel(self, _element, channel):
+        """板子建了通道。这里只转发给 TeleopClient，逻辑都在那一层。"""
+        self.teleop.attach(channel)
 
     # ---------------- 计数探针（streaming 线程，只自增） ----------------
     def _count_sent(self, _pad, info):
@@ -437,13 +657,17 @@ class Peer:
         log.info("answer 已发送")
 
     def stop(self):
+        if self.teleop is not None:
+            # 先停定时器再拆 pipeline：GLib 里还排着队的发送回调会在
+            # pipeline 为 NULL 之后去碰一个已经没了的通道。
+            self.teleop.stop()
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
 
 
 # --------------------------------------------------------------------------- #
-async def fetch_ice(session, base):
+async def fetch_ice(session, base, auth=None):
     """取 STUN/TURN 配置。
 
     **键名不是 stun/turn**：服务器下发的是 `stunUriForGst` / `turnUriForGst`
@@ -451,10 +675,13 @@ async def fetch_ice(session, base):
     照自己的直觉写 `cfg["stun"]` 会拿到空串，然后**静默退化成只用 host
     candidate** —— 局域网下照样能通，所以这个错很难被发现，
     一直到换到公网才发现打洞失败。
+
+    `auth` 只在 VPS 那种"整站都在 Basic Auth 后面"的部署里需要。
     """
     url = base + "/ice.json"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        async with session.get(url, auth=auth,
+                               timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status != 200:
                 log.warning("取 %s 回 HTTP %d，按无 STUN/TURN 处理", url, r.status)
                 return {}
@@ -470,7 +697,7 @@ async def fetch_ice(session, base):
     return ice
 
 
-async def read_device_counters(session, base, room):
+async def read_device_counters(session, base, room, auth=None):
     """从信令服务器的 /diag 读回板子的遥测。
 
     B 那一路的判据只能这么拿：板子解出了多少 opus 帧，只有它自己知道，
@@ -478,7 +705,8 @@ async def read_device_counters(session, base, room):
     """
     url = "%s/diag?room=%s" % (base, quote(room))
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+        async with session.get(url, auth=auth,
+                               timeout=aiohttp.ClientTimeout(total=8)) as r:
             if r.status != 200:
                 log.warning("读 /diag 回 HTTP %d（板子的遥测拿不到）", r.status)
                 return None
@@ -522,6 +750,16 @@ async def amain(args):
         urlsplit(base).netloc, quote(args.room))
     log.info("信令: %s", ws_url)
 
+    auth = None
+    if args.auth:
+        # 只回显"用了"，**不打印密码**。这条命令经常在共享屏幕里跑。
+        user, sep, password = args.auth.partition(":")
+        if not sep or not user:
+            log.error("--auth 的格式是 USER:PASS")
+            return 2
+        auth = aiohttp.BasicAuth(user, password)
+        log.info("已启用 Basic Auth（用户 %s）", user)
+
     ctx = None
     if scheme == "https":
         ctx = ssl.create_default_context(cafile=args.tls_ca) if args.tls_ca \
@@ -532,14 +770,14 @@ async def amain(args):
 
     conn = aiohttp.TCPConnector(ssl=ctx)
     async with aiohttp.ClientSession(connector=conn) as session:
-        ice = await fetch_ice(session, base)
+        ice = await fetch_ice(session, base, auth)
 
         loop = asyncio.get_running_loop()
         peer = Peer(loop, args, ice)
         peer.start()
 
         try:
-            ws = await session.ws_connect(ws_url, heartbeat=20,
+            ws = await session.ws_connect(ws_url, auth=auth, heartbeat=20,
                                           max_msg_size=4 * 1024 * 1024)
         except Exception as exc:  # noqa: BLE001
             log.error("连不上信令服务器: %s", exc)
@@ -574,10 +812,105 @@ async def amain(args):
 
         # 板子的计数要在会话还活着的时候读（会话一断它就不涨了，
         # 但样本还在 /diag 里，所以其实什么时候读都行）。
-        dev = await read_device_counters(session, base, args.room)
+        dev = await read_device_counters(session, base, args.room, auth)
         peer.stop()
 
     return report(args, peer, dev)
+
+
+def teleop_report(t, args, dev):
+    """C/D 两路的判据。返回失败说明列表（空 = 全过）。"""
+    fails = []
+    p95 = t.p95()
+
+    log.info("-" * 66)
+    log.info("  遥操作    通道=%s  打开=%s  已发 %d / ACK %d / NACK %d",
+             ("label=%s" % t.label) if t.seen else "没出现",
+             "是" if t.opened else "否", t.sent, t.acked, t.nacked)
+    if t.rtts:
+        log.info("            往返 p95 %.1f ms（最快 %.1f / 最慢 %.1f）",
+                 p95, min(t.rtts), max(t.rtts))
+    if t.nack_reasons:
+        log.info("            nack 原因: %s",
+                 ", ".join("%s×%d" % kv for kv in sorted(t.nack_reasons.items())))
+
+    # C：通道本身
+    if not t.seen:
+        fails.append("板子没有建 DataChannel（on-data-channel 没触发）。"
+                     "先在板子上跑 tools/check_offer.py --expect-datachannel，"
+                     "看 offer 里有没有 m=application / a=sctp-port")
+        return fails
+    if not t.opened:
+        fails.append("DataChannel 出现了但一直没打开（label=%r）—— "
+                     "SCTP/DTLS 没通，命令一条都发不出去" % t.label)
+        return fails
+    log.info("OK  C 路通：板子建的 DataChannel 打开成功")
+
+    if t.message_signal is None:
+        fails.append("DataChannel 上没有可用的消息信号，收不到回执")
+        return fails
+
+    if args.teleop_count == 0:
+        log.info("--teleop-count 0：只验通道打开，不发命令")
+        return fails
+
+    # D：命令与回执
+    before = len(fails)
+    if t.sent != args.teleop_count:
+        fails.append("只发出了 %d 条命令（期望 %d 条）—— 通道中途关了？"
+                     % (t.sent, args.teleop_count))
+    if t.unanswered():
+        fails.append("%d 条命令没等到回执（seq=%s）"
+                     % (t.unanswered(), sorted(t.pending)[:8]))
+    if t.acked < t.expected_acks:
+        fails.append("白名单内的 %d 条里只 ACK 了 %d 条"
+                     % (t.expected_acks, t.acked))
+    if t.nacked < 1:
+        fails.append("BOGUS 一条都没被拒 —— 白名单没在板子上生效？")
+    elif "unknown-command" not in t.nack_reasons:
+        fails.append("BOGUS 被拒了，但 reason=%s（期望 unknown-command）"
+                     % ", ".join(t.nack_reasons))
+    for name, value in (("重复/陌生的回执", t.unexpected),
+                        ("回显不一致", t.echo_bad),
+                        ("该 ACK 却 NACK（或反之）", t.wrong_verdict),
+                        ("回执不是合法 JSON", t.bad_reply)):
+        if value:
+            fails.append("%s：%d 条" % (name, value))
+    if p95 is not None and p95 > t.max_p95:
+        fails.append("往返 p95 %.1f ms 超过上限 %.0f ms" % (p95, t.max_p95))
+    if t.errors:
+        fails.append("DataChannel 报错 %d 次：%s" % (len(t.errors), t.errors[:3]))
+
+    if len(fails) == before:
+        log.info("OK  D 路通：%d 条全部有回执（%d ACK / %d NACK），"
+                 "白名单外的命令被正确拒绝", t.sent, t.acked, t.nacked)
+    # 板端的账。浏览器/这边记的账可能"自洽但虚假"（比如回执照抄），
+    # 只有板子自己数的 rx/ack/overlay 是另一份独立记录。
+    if dev is None:
+        log.warning("读不到板端遥测，遥操作的板端计数无法核对 —— 不算失败")
+        return fails
+    rx = dev.get("teleop_rx")
+    ack = dev.get("teleop_ack")
+    overlay = dev.get("teleop_overlay")
+    if rx is None:
+        log.warning("板端遥测里没有 teleop_* 字段（板子上跑的是旧代码？）")
+        return fails
+    if rx < t.sent - TELEOP_DEVICE_LAG:
+        fails.append("板端只收到 %d 条，这边发了 %d 条（差超过 %d）"
+                     % (rx, t.sent, TELEOP_DEVICE_LAG))
+    else:
+        log.info("OK  板端收到 %d 条（这边发了 %d）", rx, t.sent)
+    if ack is not None and ack < t.expected_acks - TELEOP_DEVICE_LAG:
+        fails.append("板端只 ACK 了 %d 条，期望 %d 条"
+                     % (ack, t.expected_acks))
+    if overlay is None:
+        log.warning("板端遥测里没有 teleop_overlay 字段")
+    elif ack is not None and overlay < ack - TELEOP_DEVICE_LAG:
+        fails.append("板端 ACK 了 %d 条却只叠加了 %d 次 —— "
+                     "回执和画面不是同一条路" % (ack, overlay))
+    else:
+        log.info("OK  板端叠加 %d 次（画面里真的出过字）", overlay)
+    return fails
 
 
 def report(args, peer, dev):
@@ -632,6 +965,11 @@ def report(args, peer, dev):
                          "再看上面的 answer 音频方向是不是 sendrecv。" % got)
         log.info("  板端计数: %s", dev)
 
+    if args.no_teleop:
+        log.info("--no-teleop：跳过 C/D 两路（遥操作）")
+    else:
+        fails.extend(teleop_report(peer.teleop, args, dev))
+
     log.info("=" * 66)
     if fails:
         for f in fails:
@@ -643,11 +981,15 @@ def report(args, peer, dev):
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="无头 WebRTC 对端：验证双向音频（不需要浏览器/麦克风/耳朵）",
+        description="无头 WebRTC 对端：验证双向音频和遥操作"
+                    "（不需要浏览器/麦克风/耳朵）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--signal", default="https://124.223.11.112",
                    help="信令服务器根地址（ws:// 或 wss:// 的完整地址也认）")
     p.add_argument("--room", required=True)
+    p.add_argument("--auth", default=None, metavar="USER:PASS",
+                   help="信令服务器的 Basic Auth。VPS 的 /ice.json、/diag、"
+                        "/ws/view 都在它后面；打板子的局域网地址时不需要")
     p.add_argument("--tls-ca", default=None, help="自签证书的路径（信任锚）")
     p.add_argument("--insecure", action="store_true",
                    help="关掉证书校验。仅用于本地排查 —— 这是关掉校验，"
@@ -657,6 +999,13 @@ def main(argv=None):
     p.add_argument("--freq", type=float, default=440.0, help="测试音频率")
     p.add_argument("--no-send-audio", action="store_true",
                    help="不建发送那一路，只测 A（板子→这边）")
+    p.add_argument("--no-teleop", action="store_true",
+                   help="完全不要求 DataChannel（阶段一/二的行为）")
+    p.add_argument("--teleop-count", type=int, default=14,
+                   help="发多少条遥操作命令（两轮：六条白名单 + 一条 BOGUS）。"
+                        "0 = 只要求通道打开、不发命令（SCTP spike）")
+    p.add_argument("--teleop-max-p95", type=float, default=300.0,
+                   help="往返延迟 p95 的上限（毫秒）")
     p.add_argument("--no-announce-ssrc", action="store_true",
                    help="不在 answer 里补 a=ssrc（复现 GStreamer 裸 answer 那个坑，"
                         "板子会报 Could not find ssrc 然后收不到音频）")
