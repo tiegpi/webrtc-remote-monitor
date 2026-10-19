@@ -12,8 +12,27 @@ coturn relay fallback.
 ![gstreamer](https://img.shields.io/badge/GStreamer-1.20-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-<!-- TODO: record a ~30 s demo (camera switch + teleop overlay + voice), save as docs/demo.gif, uncomment -->
-<!-- ![demo](docs/demo.gif) -->
+---
+
+## Demo
+
+Demo video: [WebRTC remote monitor (Bilibili)](https://www.bilibili.com/video/BV1Qenn6AEtQ/)
+
+Both screenshots below are live sessions through the two supported entry points
+(rendered at equal width):
+
+<p align="center">
+  <img src="docs/rk3588_remote_monitor_local.png" alt="LAN: browser talks to the board" width="49%">
+  <img src="docs/rk3588_remote_monitor_cloud.png" alt="WAN: browser goes through the VPS" width="49%">
+</p>
+
+| LAN: browser talks to the board | WAN: browser goes through the VPS |
+|:---:|:---:|
+| `https://<board-ip>:8443/`. Page, signaling and media stay on the LAN; the board serves the page and proxies signaling | `https://<vps>/webrtc`. nginx terminates TLS and enforces Basic Auth; media uses coturn relay when it cannot go direct |
+
+Both entries point at the **same room and the same publisher**. One viewer is a design
+constraint, so they cannot watch simultaneously: the second connection is rejected with
+an explicit "device busy" status instead of kicking the first viewer off.
 
 ---
 
@@ -164,26 +183,172 @@ Open `https://<board-ip>:8443/`. The page asks `/config.json` for the room numbe
 `?room=` is optional. Accept the self-signed certificate once; that also unlocks
 `getUserMedia` for two-way voice.
 
-### Public deployment
+### Public deployment (current shape)
+
+Three stages: **VPS** (signaling + coturn + viewer page + nginx), **board** (publisher +
+LAN page), and **verification** from any machine that can reach either. The repo lives
+on the dev machine and the board; the VPS copy is pushed by the deploy scripts, so no
+`git clone` is needed there.
+
+| Run on | What it does | Command |
+|---|---|---|
+| VPS | signaling server + coturn | `sudo bash tools/deploy_vps.sh` |
+| dev machine | viewer page + nginx routes | `VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh` |
+| board | publisher + LAN page | `tools/service.sh start` |
+
+#### 0. Prerequisites
+
+**VPS**
+
+- Ubuntu, reachable over ssh, with **passwordless `sudo`** for the deploy account
+  (`deploy_web_vps.sh` runs `ssh ... 'sudo ...'` without a tty, so it cannot prompt).
+- Security group **and** host firewall open: `TCP 443`, `UDP 3478`, `TCP 3478`,
+  `UDP 49160-49200` (TURN relay range, matching `turnserver.conf`).
+- `/etc/nginx/sites-available/default` must contain a **443 default server**;
+  `deploy_web_vps.sh` only adds `location` blocks, it does not create the server:
+
+  ```nginx
+  server {
+      listen 443 ssl http2 default_server;
+      server_name _;
+      ssl_certificate     /etc/nginx/ssl/self.crt;
+      ssl_certificate_key /etc/nginx/ssl/self.key;
+      location / { return 404; }
+  }
+  ```
+
+  Sign the certificate once (the private key never leaves the VPS):
+
+  ```bash
+  sudo mkdir -p /etc/nginx/ssl
+  sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout /etc/nginx/ssl/self.key -out /etc/nginx/ssl/self.crt \
+      -subj "/CN=<VPS_IP>" \
+      -addext "subjectAltName=IP:<VPS_IP>" \
+      -addext "basicConstraints=critical,CA:TRUE"
+  sudo chmod 600 /etc/nginx/ssl/self.key
+  ```
+
+  Copy `self.crt` back to the dev machine as `certs/vps-self.crt`; the board and the
+  verification tools use it as their trust anchor.
+
+**Board**
+
+- Debian/Ubuntu arm64 with the vendor MPP GStreamer plugins (see Prerequisites).
+- ssh access; the publish directory is fixed at `~/webrtc-remote-monitor`.
+- `rsync` available for syncing the source tree.
+
+**Dev machine**
+
+- This repo, plus `ssh` / `rsync` to both the VPS and the board.
+
+#### 1. VPS: signaling + coturn
+
+`deploy_vps.sh` runs **on the VPS** and needs the repo's `src/`:
 
 ```bash
-# on the VPS
-sudo bash tools/deploy_vps.sh
-
-# on the machine that holds this repo (installs the page service + nginx routes)
-bash tools/deploy_web_vps.sh
-
-# on the board: fill in the env file, then run both services
-cp .env.example .env && $EDITOR .env
-tools/run-agent.sh
-tools/run-web.sh
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ ubuntu@<vps>:~/webrtc-remote-monitor/
+ssh -t ubuntu@<vps> 'cd ~/webrtc-remote-monitor && sudo bash tools/deploy_vps.sh'
 ```
 
-`deploy_vps.sh` generates the room, publisher token, TURN secret and viewer
-credentials; `deploy_web_vps.sh` prints the external URL and protects every viewing
-route with HTTP Basic Auth. See [docs/architecture.md](docs/architecture.md) for the
-full topology, credential flow, and why `/ws/publish` deliberately stays outside
-Basic Auth.
+It installs coturn + aiohttp, probes the public/private IPs, writes
+`/etc/turnserver.conf` and `/etc/webrtc-signal.env` (room, publisher token, TURN
+secret), installs `webrtc-signal.service` (loopback-only `127.0.0.1:8443`), and
+self-checks. Keep the **room** and **token** it prints for the board's `.env`.
+
+#### 2. VPS: viewer page + nginx
+
+From the **dev machine**:
+
+```bash
+VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh
+```
+
+It pushes `signal_server.py`, `web_server.py` and `monitor.html` to
+`/opt/webrtc-signal/` and `/opt/webrtc-web-server/`, installs `webrtc-web.service`
+(`127.0.0.1:8444`), installs the nginx snippet, adds HTTP Basic Auth to every viewing
+route, and prints the external URL and credentials. `/ws/publish` is deliberately
+left outside Basic Auth — it authenticates with the publisher token.
+
+Put `VPS_HOST` in `.env` if you want `tools/service_vps.sh` to work without the
+prefix.
+
+#### 3. Board: code + certificates + `.env`
+
+```bash
+# 1) sync source; leaves the board's .env / certs / run untouched
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ orangepi@<board>:~/webrtc-remote-monitor/
+
+# 2) the board's own self-signed cert (IP SAN; required for the browser microphone)
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && bash tools/gen_cert.sh'
+
+# 3) public half of the VPS certificate, used as the trust anchor
+scp certs/vps-self.crt orangepi@<board>:~/webrtc-remote-monitor/certs/
+
+# 4) fill in .env
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDITOR .env'
+```
+
+| Variable | Purpose | Where it comes from |
+|---|---|---|
+| `ROOM` | the only room the signaling server accepts | `/etc/webrtc-signal.env` or the deploy output |
+| `TOKEN` | publisher token for `/ws/publish` | same |
+| `SIGNAL_HOST` | VPS public IP / hostname | your VPS |
+| `SIGNAL_AUTH` | `user:pass` for `/ice.json`, `/diag`, `/ws/view` | printed by `deploy_web_vps.sh` |
+
+#### 4. Start / stop (board)
+
+```bash
+tools/service.sh start          # web + agent; returns only when both are usable
+tools/service.sh status
+tools/service.sh logs agent -f
+tools/service.sh restart
+tools/service.sh stop
+```
+
+Processes run in their own session (ssh disconnect does not kill them); pids live in
+`run/*.pid` and logs in `run/*.log` (both gitignored). Target one service with
+`web` / `agent`, e.g. `tools/service.sh restart agent`.
+
+For foreground debugging, `tools/run-web.sh` and `bash -l tools/run-agent.sh` still
+work; the agent needs `-l` because the BSP exports its GStreamer environment only in
+login shells.
+
+#### 5. Day-to-day operations
+
+The VPS services are systemd units; `tools/service_vps.sh` is a thin wrapper:
+
+```bash
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh status
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh restart web
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh logs signal -f
+```
+
+| Service | Where | Listen / path | Logs |
+|---|---|---|---|
+| `webrtc-signal` | VPS | `127.0.0.1:8443`, `/opt/webrtc-signal/signal_server.py` | `journalctl -u webrtc-signal` |
+| `webrtc-web` | VPS | `127.0.0.1:8444`, `/opt/webrtc-web-server/` | `journalctl -u webrtc-web` |
+| `coturn` | VPS | 3478/udp+tcp, 49160-49200/udp | `journalctl -u coturn` |
+| `nginx` | VPS | `443` | `/var/log/nginx/error.log` |
+| agent | board | outbound only, `wss://<vps>/ws/publish` | `run/agent.log` |
+| web | board | `https://<board-ip>:8443/` | `run/web.log` |
+
+Updating the code:
+
+```bash
+# VPS (restarts signaling and the page service)
+VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh
+
+# board (sync, then restart)
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ orangepi@<board>:~/webrtc-remote-monitor/
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && tools/service.sh restart'
+```
+
+See [docs/architecture.md](docs/architecture.md) for the credential flow, nginx
+routing, and why `/ws/publish` deliberately stays outside Basic Auth.
 
 ### Common flags
 
@@ -261,7 +426,14 @@ src/
   sdpview.py         SDP → human-readable media sections (shared by tools)
 web/
   monitor.html       the whole viewer UI: one file, no build step
-tools/               deployment, acceptance criteria, protocol tests, hardware probes
+tools/
+  service.sh        board services: start / stop / restart / status / logs
+  service_vps.sh    manage the VPS systemd units from the dev machine
+  run-agent.sh run-web.sh  foreground start (debugging)
+  deploy_vps.sh     VPS: signaling + coturn
+  deploy_web_vps.sh VPS: page service + nginx routes
+  gen_cert.sh       board self-signed certificate
+  analyze_diag.py   main acceptance criteria
 docs/architecture.md  the deep dive: topology, threads, and every silent failure
 ```
 

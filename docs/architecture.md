@@ -189,7 +189,9 @@ web/
   monitor.html      整个观看页：一个文件，没有构建步骤
 
 tools/
-  run-agent.sh run-web.sh     起服务
+  service.sh                  板子服务管理：start / stop / restart / status / logs
+  service_vps.sh              在开发机上管理 VPS 的 systemd 服务
+  run-agent.sh run-web.sh     前台启动（调试用）
   gen_cert.sh deploy_vps.sh   板子证书 / 部署（VPS 那张自签证书是手工签的，见第二节）
   deploy_web_vps.sh           VPS 上的观看页服务 + nginx 路由
   analyze_diag.py             **主验收**：13 条（视频）、17 条（含音频）或 22 条（含遥操作）判据
@@ -578,11 +580,16 @@ VPS 上：`sudo bash tools/deploy_vps.sh` 装 coturn，并生成
 注意：统一后的信令源码**没有** camera-pipeline 版的 `/call`、`/media`、`/ws/call`，
 那套双人通话演示不再由这台 VPS 的 8443 提供；要恢复得回 camera-pipeline 项目单独部署。
 
-板子上：填好 `.env`（`ROOM`、`TOKEN`、`SIGNAL_HOST`、`SIGNAL_AUTH`）后跑
-`tools/run-agent.sh`，同时跑 `tools/run-web.sh` 提供局域网观看页。两个脚本都从
-`.env` 读，`SIGNAL_AUTH` 必须和 VPS 上部署脚本打印的那组观看端凭证一致 ——
+板子上：填好 `.env`（`ROOM`、`TOKEN`、`SIGNAL_HOST`、`SIGNAL_AUTH`）后用
+`tools/service.sh start` 起两个服务（`start|stop|restart|status|logs`，进程在
+`run/*.pid`，日志在 `run/*.log`）。`tools/run-agent.sh` / `tools/run-web.sh` 仍然
+可用，但它们是**前台**进程，适合调试。两个入口都从 `.env` 读，`SIGNAL_AUTH`
+必须和 VPS 上部署脚本打印的那组观看端凭证一致 ——
 板子替浏览器访问 VPS 的 `/ice.json`、`/diag`、`/ws/view` 时要带上它。
 直接传命令行参数也可以，但 `.env` 是唯一推荐方式（两边不会写岔）。
+
+完整的从零部署步骤（VPS 的 nginx 443 前置、证书、代码同步、`.env` 四项）见
+[README.zh-CN.md 的"公网部署"](../README.zh-CN.md#公网部署当前形态)。
 
 浏览器：
 

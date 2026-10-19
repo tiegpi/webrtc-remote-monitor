@@ -12,6 +12,26 @@ DTLS/SRTP + ICE，局域网直连，跨网时由 coturn 中继兜底。同一份
 
 ---
 
+## 演示
+
+演示视频：[WebRTC 远程监控（B 站）](https://www.bilibili.com/video/BV1Qenn6AEtQ/)
+
+同一个页面有两种接入方式，下面的截图分别是两种入口的实际画面（两张图等宽显示）：
+
+<p align="center">
+  <img src="docs/rk3588_remote_monitor_local.png" alt="局域网：浏览器直连板子" width="49%">
+  <img src="docs/rk3588_remote_monitor_cloud.png" alt="公网：浏览器经 VPS 访问" width="49%">
+</p>
+
+| 局域网：浏览器直连板子 | 公网：浏览器经 VPS 访问 |
+|:---:|:---:|
+| `https://<板子IP>:8443/`。页面、信令、媒体都在局域网内；板子直接服务页面并代理信令 | `https://<VPS>/webrtc`。nginx 终结 TLS 并做 Basic Auth；跨网时媒体由 coturn 中继 |
+
+两边是**同一个房间、同一条推流**。单观看端是设计约束，所以两个入口不能同时看，
+后连的会收到明确的"设备忙"提示，而不是把先连的顶下线。
+
+---
+
 ## 能做什么
 
 | 功能 | 说明 |
@@ -148,25 +168,176 @@ python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080
 > 只启动 `signal_server.py` 也能看画面（它自己会在 `/` 提供页面），但没有
 > `web_server.py` 的 `/camera` 代理，页面上不会出现切换摄像头的按钮。
 
-### 公网部署
+### 公网部署（当前形态）
+
+一次完整部署分三段：**VPS**（信令 + coturn + 观看页 + nginx）、**板子**（推流端 +
+局域网页面）、**验收**（开发机或任何能访问的机器）。仓库只需要在开发机和板子上
+各有一份；VPS 上的文件由脚本推送，不用 `git clone`。
+
+| 在哪台机器跑 | 做什么 | 命令 |
+|---|---|---|
+| VPS | 信令服务器 + coturn | `sudo bash tools/deploy_vps.sh` |
+| 开发机 | 观看页服务 + nginx 路由 | `VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh` |
+| 板子 | 推流端 + 局域网页面 | `tools/service.sh start` |
+
+#### 0. 准备
+
+**VPS**
+
+- Ubuntu，能 ssh 登录，账号可**免密 `sudo`**（`deploy_web_vps.sh` 用
+  `ssh ... 'sudo ...'` 执行，没有分配 tty，无法现场输密码）。
+- 安全组和主机防火墙都放行：`TCP 443`、`UDP 3478`、`TCP 3478`、
+  `UDP 49160-49200`（TURN relay 端口，和 `turnserver.conf` 的 min/max-port 一致）。
+- `/etc/nginx/sites-available/default` 里要有一个 **443 default server**；
+  `deploy_web_vps.sh` 只往里加 `location`，不负责建 server 块。最小形态：
+
+  ```nginx
+  server {
+      listen 443 ssl http2 default_server;
+      server_name _;
+      ssl_certificate     /etc/nginx/ssl/self.crt;
+      ssl_certificate_key /etc/nginx/ssl/self.key;
+      location / { return 404; }
+  }
+  ```
+
+  证书手工签一次（仓库里不会有私钥）：
+
+  ```bash
+  sudo mkdir -p /etc/nginx/ssl
+  sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout /etc/nginx/ssl/self.key -out /etc/nginx/ssl/self.crt \
+      -subj "/CN=<VPS_IP>" \
+      -addext "subjectAltName=IP:<VPS_IP>" \
+      -addext "basicConstraints=critical,CA:TRUE"
+  sudo chmod 600 /etc/nginx/ssl/self.key
+  ```
+
+  把 `self.crt` 拷回开发机的 `certs/vps-self.crt`，板子和验收工具拿它当信任锚。
+
+**板子**
+
+- Debian/Ubuntu arm64，已装 BSP 的 MPP GStreamer 插件（见上面的依赖）。
+- 能 ssh；发布时间目录固定为 `~/webrtc-remote-monitor`。
+- 有 `rsync`（从开发机同步源码用）。
+
+**开发机**
+
+- 本仓库；能 ssh / rsync 到 VPS 和板子。
+
+#### 1. VPS：信令 + coturn
+
+`deploy_vps.sh` 要在 VPS 上跑，并且需要仓库里的 `src/`：
 
 ```bash
-# VPS
-sudo bash tools/deploy_vps.sh
-
-# 持有本仓库的机器（安装观看页服务 + nginx 路由）
-bash tools/deploy_web_vps.sh
-
-# 板子：填好 .env 后启动两个服务
-cp .env.example .env && $EDITOR .env
-tools/run-agent.sh
-tools/run-web.sh
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ ubuntu@<vps>:~/webrtc-remote-monitor/
+ssh -t ubuntu@<vps> 'cd ~/webrtc-remote-monitor && sudo bash tools/deploy_vps.sh'
 ```
 
-`deploy_vps.sh` 生成房间号、推流 token、TURN 密钥和观看端凭证；`deploy_web_vps.sh`
-打印外网地址，并给所有观看相关路径加 HTTP Basic Auth。凭证流程、nginx 路由，以及
-`/ws/publish` 为什么**不加** Basic Auth，见 [docs/architecture.md](docs/architecture.md)
-第二节。
+它做四件事：
+
+1. 装 coturn 和 python3-aiohttp；
+2. 探测公网 / 内网 IP，写 `/etc/turnserver.conf`；
+3. 生成或复用 `/etc/webrtc-signal.env`（`ROOM` / `TOKEN` / `TURN_SECRET` / `PUBLIC_IP`）；
+4. 装 `webrtc-signal.service`（只监听 `127.0.0.1:8443`），启动并自检。
+
+记住脚本打印的 **ROOM** 和 **TOKEN**，板子的 `.env` 要用。
+
+#### 2. VPS：观看页 + nginx
+
+在**开发机**上跑：
+
+```bash
+VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh
+```
+
+它会把 `signal_server.py`、`web_server.py`、`monitor.html` 推到
+`/opt/webrtc-signal/` 和 `/opt/webrtc-web-server/`，装 `webrtc-web.service`
+（`127.0.0.1:8444`），写 nginx snippet，给所有观看路径加 HTTP Basic Auth，
+最后打印外网地址和账号密码。`/ws/publish` 有意**不加** Basic Auth，只认 TOKEN。
+
+也可以把 `VPS_HOST` 写进 `.env`，之后跑 `tools/service_vps.sh` 就不用每次带。
+
+#### 3. 板子：代码 + 证书 + `.env`
+
+```bash
+# 1) 同步代码；不覆盖板子上的 .env / certs / run
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ orangepi@<board>:~/webrtc-remote-monitor/
+
+# 2) 板子自己的自签证书（带 IP SAN；浏览器麦克风要求安全上下文）
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && bash tools/gen_cert.sh'
+
+# 3) VPS 证书的公钥副本，当信任锚
+scp certs/vps-self.crt orangepi@<board>:~/webrtc-remote-monitor/certs/
+
+# 4) 填 .env
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDITOR .env'
+```
+
+`.env` 四项：
+
+| 变量 | 作用 | 从哪来 |
+|---|---|---|
+| `ROOM` | 房间号，信令服务器只认它 | `/etc/webrtc-signal.env`，或部署脚本打印 |
+| `TOKEN` | 推流 token，`/ws/publish` 只认它 | 同上 |
+| `SIGNAL_HOST` | VPS 公网 IP / 域名 | 你的 VPS |
+| `SIGNAL_AUTH` | `user:pass`，板子访问 VPS 的 `/ice.json`、`/diag`、`/ws/view` 用 | `deploy_web_vps.sh` 打印 |
+
+#### 4. 启动 / 停止（板子）
+
+```bash
+tools/service.sh start          # web + agent，等到真的可用才返回
+tools/service.sh status         # 进程、健康检查、agent 最后一行日志
+tools/service.sh logs agent -f
+tools/service.sh restart
+tools/service.sh stop
+```
+
+进程起在独立会话里，ssh 断开不受影响；pid 在 `run/*.pid`，日志在 `run/*.log`
+（都已 gitignore）。只操作一个服务就加 `web` / `agent`：
+
+```bash
+tools/service.sh restart agent
+```
+
+前台调试仍然可以直接跑 `tools/run-web.sh` / `bash -l tools/run-agent.sh`；
+agent 必须带 `-l`，因为 BSP 的 GStreamer 环境变量只在登录 shell 里导出。
+
+#### 5. 日常运维
+
+VPS 上由 systemd 管理，开发机上有一个薄封装：
+
+```bash
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh status
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh restart web
+VPS_HOST=ubuntu@<vps> tools/service_vps.sh logs signal -f
+```
+
+| 服务 | 跑在哪 | 监听 / 路径 | 日志 |
+|---|---|---|---|
+| `webrtc-signal` | VPS | `127.0.0.1:8443`，`/opt/webrtc-signal/signal_server.py` | `journalctl -u webrtc-signal` |
+| `webrtc-web` | VPS | `127.0.0.1:8444`，`/opt/webrtc-web-server/` | `journalctl -u webrtc-web` |
+| `coturn` | VPS | 3478/udp+tcp，49160-49200/udp | `journalctl -u coturn` |
+| `nginx` | VPS | `443` | `/var/log/nginx/error.log` |
+| agent | 板子 | 只出站，连 `wss://<VPS>/ws/publish` | `run/agent.log` |
+| web | 板子 | `https://<板子IP>:8443/` | `run/web.log` |
+
+更新代码：
+
+```bash
+# VPS（会重启信令和观看页）
+VPS_HOST=ubuntu@<vps> bash tools/deploy_web_vps.sh
+
+# 板子（同步后重启）
+rsync -az --exclude .git --exclude .env --exclude certs --exclude run \
+    ./ orangepi@<board>:~/webrtc-remote-monitor/
+ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && tools/service.sh restart'
+```
+
+凭证流程、nginx 路由，以及 `/ws/publish` 为什么**不加** Basic Auth，见
+[docs/architecture.md](docs/architecture.md) 第二节。
 
 ### 常用参数
 
@@ -238,7 +409,15 @@ src/
   sdpview.py         SDP → 人话（工具共用）
 web/
   monitor.html       整个观看页：单文件、无构建步骤
-tools/               部署、验收判据、协议测试、硬件排查
+tools/
+  service.sh         板子服务管理：start / stop / restart / status / logs
+  service_vps.sh     在开发机上管理 VPS 的 systemd 服务
+  run-agent.sh run-web.sh  前台启动（调试用）
+  deploy_vps.sh      VPS：信令 + coturn
+  deploy_web_vps.sh  VPS：观看页服务 + nginx 路由
+  gen_cert.sh        板子自签证书
+  analyze_diag.py    主验收判据
+  check_* / selftest.py / turn_check.py …  专项排查工具
 docs/architecture.md 深潜水：拓扑、线程模型、静默失败记录
 ```
 
