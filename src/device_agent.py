@@ -37,6 +37,7 @@ from gi.repository import GLib
 
 import audio             # 音频设备探测：判错设备不会报错，只会推一路本底噪声
 import camera            # 画质兜底：板子没有 3A，亮度只能自己闭环
+import detect            # 人像检测：板端 NPU，页面只负责画框
 import pipeline          # 必须早于 Gst.init()：它会在导入时清掉 BSP 埋的环境变量
 import sources           # 板子上有哪些摄像头、各自要什么
 import whitebalance      # 画质兜底：同一根因的另一半 —— ISP 没跑 AWB，画面偏绿
@@ -139,7 +140,10 @@ class AgentState:
         # 否则被拒绝的第二个观看端一离开，就会把第一个的会话拆掉。
         self.viewer_id = None
         self.source = sources.initial(args.camera_source)
-        self.lock = asyncio.Lock()      # 串行化切换，防页面连点
+        self.lock = asyncio.Lock()      # 串行化切换/检测开关，防页面连点
+        # 检测开关是**进程级**的选择：没有观看端时点开关只改它，下一个会话
+        # 接入时按这个值建检测线程。
+        self.detect_enabled = bool(getattr(args, "detect", False))
 
     def current_name(self):
         if self.session is not None:
@@ -272,11 +276,91 @@ async def handle_camera(request):
         return web.json_response({"ok": True, "current": applied, "applied": True})
 
 
+async def handle_detect(request):
+    """GET  = 检测是否可用 + 当前开关
+    POST = {"enabled": true/false}
+    """
+    state = request.app["state"]
+    problem = detect.check_available(state.args.detect_model)
+
+    if request.method == "GET":
+        session = state.session
+        live = None
+        if session is not None and not session.stopped:
+            try:
+                live = session.detect_state()
+            except Exception:                # noqa: BLE001
+                live = None
+        return web.json_response({
+            "available": problem is None,
+            "reason": problem,
+            "enabled": bool(live["enabled"]) if live else state.detect_enabled,
+            "model": state.args.detect_model,
+            "fps": state.args.detect_fps,
+            "conf": state.args.detect_conf,
+            "session": live,
+        })
+
+    try:
+        body = await request.json()
+    except Exception:                       # noqa: BLE001
+        return web.json_response(
+            {"ok": False, "error": "请求体不是 JSON"}, status=400)
+
+    enabled = (body or {}).get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        # bool 和 int 在 Python 里能混用（True == 1），所以这里显式判类型：
+        # 放过去会让 {"enabled": "true"} 静默变成"没开"或"开了"，都不对。
+        return web.json_response(
+            {"ok": False,
+             "error": '请求体里要有 enabled 布尔值，如 {"enabled": true}'},
+            status=400)
+    if enabled and problem:
+        return web.json_response(
+            {"ok": False,
+             "error": "人像检测不可用: %s" % problem.splitlines()[0],
+             "reason": problem},
+            status=409)
+
+    # 和摄像头切换共用一把锁：检测线程停/起不能和采集段拆/建交错。
+    async with state.lock:
+        session = state.session
+        applied = False
+        if session is not None and not session.stopped:
+            try:
+                ok = await run_on_glib(session.set_detect, enabled)
+            except Exception as exc:         # noqa: BLE001
+                log.exception("切换人像检测失败")
+                return web.json_response(
+                    {"ok": False, "error": "切换人像检测失败: %s" % exc},
+                    status=500)
+            if not ok:
+                # 页面刚连上、pipeline 还没建好时点开关：会话对象在了，但
+                # 采集段还没有 detsink。这不是失败 —— 意图已经记在会话上，
+                # _start_on_glib 建好管线后会自己开启。
+                if session.switch is None:
+                    state.detect_enabled = enabled
+                    return web.json_response(
+                        {"ok": True, "enabled": enabled, "applied": False})
+                # 真的开不起来：模型加载/NPU 初始化失败。
+                # 把实际状态带回去，页面据此把按钮恢复成"关"。
+                state.detect_enabled = False
+                return web.json_response(
+                    {"ok": False, "enabled": False,
+                     "error": "人像检测开不起来，具体原因看 agent 日志"},
+                    status=500)
+            applied = True
+        state.detect_enabled = enabled
+        return web.json_response(
+            {"ok": True, "enabled": enabled, "applied": applied})
+
+
 async def start_control(state):
     """起本地控制端点。返回 AppRunner，由调用方在退出时 cleanup。"""
     app = web.Application()
     app["state"] = state
     app.router.add_route("*", "/camera", handle_camera)
+    app.router.add_route("*", "/detect", handle_detect)
 
     path = socket_path(state.args)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +374,7 @@ async def start_control(state):
     await web.UnixSite(runner, str(path)).start()
     # 只有本机、而且只有跑 web_server 的那个用户可以调它。
     os.chmod(path, 0o600)
-    log.info("控制端点 %s（GET/POST /camera）", path)
+    log.info("控制端点 %s（GET/POST /camera、/detect）", path)
     return runner
 
 
@@ -402,6 +486,7 @@ async def publish_once(args, state, url, ice_url):
                         state.session = DeviceSession(
                             tag_viewer(sender, vid), loop, args, ice,
                             source=state.source,
+                            detect_enabled=state.detect_enabled,
                         )
                         state.viewer_id = vid
                         try:
@@ -669,6 +754,20 @@ def parse_args(argv=None):
                    help="修偏绿（ISP 没跑 AWB）。不带值=自校准（灰世界，前 15 帧）；"
                         "也可以直接给 \"R,B\" 两个增益，如 1.71,1.55。不给就不校正")
 
+    d = p.add_argument_group(
+        "人像检测（阶段四，板端 NPU + 页面叠加框）。默认关闭，观看页上有开关；"
+        "没有观看端时开关只被记住，下一个会话按它生效")
+    d.add_argument("--detect", action="store_true",
+                   help="启动时直接开启检测（等价于页面上一开始就把开关打开）。"
+                        "显式给了但它用不了（模型/依赖缺失）会直接报错退出")
+    d.add_argument("--detect-model", default=detect.MODEL_DEFAULT,
+                   help="YOLOv5 RKNN 模型路径。模型不入库，换机器时指到实际文件")
+    d.add_argument("--detect-fps", type=int, default=5,
+                   help="检测采样率（实际会被夹在 1~15）。5fps 下单帧约 30ms，"
+                        "只占 NPU 单核约 15%%")
+    d.add_argument("--detect-conf", type=float, default=detect.CONF_DEFAULT,
+                   help="person 置信度阈值。调低更敏感但误报更多")
+
     s = p.add_argument_group(
         "音频（阶段二）。不给设备就自动探测，探测顺序见 src/audio.py")
     s.add_argument("--mic-device", default=None,
@@ -696,6 +795,20 @@ def main(argv=None):
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # 人像检测的依赖/模型在启动时先验掉：公网模式下每来一个观看端就会建会话，
+    # 拖到第一次开检测才发现"模型不存在"会按观看端重复报错，而且容易让人以为
+    # 视频链路坏了。**只有显式 --detect 时才把缺失当致命错误**；否则检测只是
+    # 一个可选功能，视频该照常跑。
+    detect_problem = detect.check_available(args.detect_model)
+    if detect_problem:
+        if args.detect:
+            log.error("--detect 用不了：%s", detect_problem)
+            return 2
+        log.info("人像检测不可用（不影响视频）：%s", detect_problem.splitlines()[0])
+    else:
+        log.info("人像检测可用：模型 %s（%d fps，conf %.2f）",
+                 args.detect_model, args.detect_fps, args.detect_conf)
 
     # 白平衡的参数和依赖在建 pipeline 之前先验掉：公网模式下每来一个观看端就会
     # 建一条 pipeline，拖到那时候才发现"板子上没装 numpy"会按观看者数重复报错。

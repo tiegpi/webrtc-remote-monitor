@@ -184,6 +184,7 @@ src/
   signal_server.py  信令服务器（局域网跑在板子上，公网跑在 VPS 上，同一个文件）
   sdpview.py        把 SDP 读成人话（板子和工具共用）
   teleop.py         遥操作协议：白名单、校验、ACK/NACK、叠加文案（纯标准库）
+  detect.py         人像检测：RKNN 推理线程 + 纯 numpy 后处理（无 cv2）
 
 web/
   monitor.html      整个观看页：一个文件，没有构建步骤
@@ -198,6 +199,8 @@ tools/
   check_switch.sh             切换摄像头那组 13 条判据
   check_fd.sh                 会话拆除后设备 fd 有没有还回去
   check_teleop.py             遥操作协议单测（宿主机，无 GStreamer）
+  check_detect.py             检测后处理单测（宿主机）；--model 时跑一次真实推理
+  check_detect.sh             /detect 开关的端到端判据（帧数涨/停、错误数）
   check_textoverlay.py        textoverlay 三种采集组合的帧率实测（板子）
   check_audio.sh check_offer.py selftest.py turn_check.py freeze_stats.py …
                              单项排查工具
@@ -383,6 +386,83 @@ VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 u
 `m=application` 并触发 `on-data-channel`，而且交给回调时通道**已经是 open**
 （所以回调里必须处理"已打开"这个分支）。
 
+### 人像检测：NPU 旁路 + 页面叠加层（阶段四）
+
+检测在板子的 RK3588 NPU 上跑（`rknn-toolkit-lite2` + YOLOv5s 的 `.rknn`），
+浏览器只负责画框。三条边界先说清：
+
+**不碰视频流。** 检测旁路从 `textoverlay` 之后的 `tee` 分出去：
+
+```
+                    ┌─ queue ─ mpph264enc ─ h264parse ─ rtph264pay ─> webrtcbin
+v4l2src ! … ! textoverlay ─ tee ─┤
+                    └─ queue(leaky) ─ valve(drop=true) ─ videorate ─
+                       videoscale ─ videoconvert ! video/x-raw,format=RGB ─ appsink
+```
+
+- `valve` 默认 **关**：没开检测时这一支一个 buffer 都不走，空闲成本约等于零，
+  也不会因为多一个消费者改变主路的时序。
+- 检测支路的 `queue` 是 `leaky=downstream max-size-buffers=2`：NPU 慢的时候
+  丢旧帧，**绝不反压主路**。主路一旦被检测拖住，丢的会是编码帧。
+- `videoscale` 必须在 `videoconvert` 之前。`videoconvert` 不能改尺寸（实测
+  在 `v4l2src` 上 `not-negotiated`），而检测输入固定 640×360（16:9 不补边）。
+- `appsink` 用 `max-buffers=1 drop=true sync=false`，检测线程按 100 ms 超时
+  拉帧，再由 `videorate` 限到 5 fps。
+- 帧的行对齐（stride）从 buffer 大小反推（`frame_stride()`），**不用
+  `GstVideo.VideoInfo.from_caps()`** —— 后者在检测线程里调过之后，会话收尾的
+  `rknn.release()` 会段错误，见 7.8。
+
+**结果走已有的 DataChannel，不新开通道。** 项目和信令都只协商一次、一个会话
+只有一条通道（见上一节），检测消息和遥操作回执共用它，靠 `t` 分流：
+
+```
+板子 → 浏览器 {"t":"det","on":true,"ts":…,"ms":12.3,"n":1,
+              "boxes":[[x,y,w,h,score], …]}
+               {"t":"det","on":false}          // 开关状态
+```
+
+坐标是**归一化的**（0~1，相对画面左上角）。页面不需要知道摄像头是 720p 还是
+1080p，CSS 尺寸变了也不用重新对齐；框的绘制与视频分辨率彻底解耦。
+
+**后处理只用 numpy。** 板子上的 `cv2` 和 numpy 2.x 不兼容（import 时
+`numpy.core.multiarray` 失败），所以 `detect.py` 自己做 letterbox、anchor 解码、
+NMS 和归一化，不引 OpenCV。这三段最容易静默出错（框整体偏移、框错位、同一个人
+叠几层框），`tools/check_detect.py` 用合成张量把期望坐标算死，宿主机就能跑。
+
+**为什么框不烧进视频流。** 烧录（例如 `cairooverlay`）的好处是任何客户端、
+任何截图都带框；代价是每帧都要过 Cairo、开关会改变编码输入、而且画面里从此
+分不出"检测到的"和"录下来的"。现在选的是页面叠加层：检测开关不碰编码参数，
+录像/截图是干净画面，关掉之后一个框都不剩。要改成烧录，改的是 pipeline 的
+采集段，不是页面。
+
+**线程与生命周期。** 检测线程自己拉 appsink、跑 NPU，但结果**不能直接发
+DataChannel** —— 通道属于 GLib 线程，跨线程碰它是未定义行为。所以检测线程
+回调里用 `GLib.idle_add` 投回 GLib 线程再 `_dc_send`（和遥操作的规则相同）。
+
+拆会话/换摄像头时顺序是死的：**先 `detector.stop()` 再动采集段**。旧 appsink
+手里可能还攥着旧 buffer，会把旧采集段的 buffer pool 拖到析构不了 —— 正是
+7.5 那条 fd 泄漏链路。`release()`（放 NPU 上下文）必须早于 pipeline dispose；
+换源后 `switch_source()` 在 `finally` 里重新绑 `detsink`/`dvalve`，检测开着的话
+把线程挂到**新** appsink 上并重新开 valve。
+
+**控制入口。** `GET/POST /detect` 和 `/camera` 同一条路：页面 → 同源
+`web_server.py` → 板子上的 unix socket（0600）→ `device_agent`。GET 返回
+`available`（模型/依赖在不在）、当前开关和会话里的帧数/错误数；POST
+`{"enabled": bool}` 在 GLib 线程上开关。两条状态要分开：
+
+- `_detect_requested` 是**意图**，跟着进程走。没有观看端时 POST 只更新它，
+  下一次建会话时自动开启；
+- `detect_enabled` 是**实际**状态（线程在跑、valve 开着），只有真的挂上
+  appsink 才为真。
+
+模型加载是懒的：没开检测就不建 NPU 上下文。模型缺失时 `/detect` 报不可用、
+页面按钮置灰，视频链路照常 —— 这是刻意的，检测不是视频的前置条件。
+
+**模型不入库。** `.rknn` 文件体积大、和板子/工具链版本绑定，仓库里只写默认
+路径（`/userdata/rknn_yolov5_demo/model/RK3588/yolov5s-640-640.rknn`）。
+YOLOv5 的代码和权重是 AGPL-3.0，自己转换的权重同样受约束；本项目的 MIT
+只覆盖仓库里的代码。演示和部署时用 `--detect-model` 指到实际文件。
+
 ---
 
 ## 六、线程模型
@@ -393,19 +473,24 @@ VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 u
 ┌─ 主线程 ──────────── asyncio 事件循环，跑 WebSocket 收发
 │                        on_signal() 在这里被调用
 │
-└─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+├─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+│
+└─ person-detect 线程 ─ 拉检测 appsink、跑 NPU（阶段四，按需创建）
 ```
 
 GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能在 asyncio 线程里写。
-两个方向的跨越**各有一处，且只有一处**：
+跨线程的通道**各有一处，且只有一处**：
 
 | 方向 | 在哪 |
 |---|---|
 | asyncio → GLib | `on_signal()` 里 emit webrtcbin 的信号，会同步派发到 GLib 线程 |
 | GLib → asyncio | `_send_threadsafe()` 用 `run_coroutine_threadsafe` 投回去 |
+| 检测线程 → GLib | `GLib.idle_add(self._send_detect_result, …)`，再 `_dc_send` |
 
 不要在别的任何地方跨线程碰对方的对象。切摄像头是第三个例子：它只能在 GLib 线程
 调用，所以 HTTP 端点用 `GLib.idle_add` 投递、用 `loop.call_soon_threadsafe` 回填结果。
+检测线程和 appsink 的关系同理：`Detector.start/stop` 只碰 appsink 和它自己的线程，
+真正发消息的那一步永远在 GLib 线程。
 
 **单观看端**：本项目按遥操作场景设计，同一时刻只允许一个观看端，所以代码里没有
 viewer id 那套东西。第二个观看端会被回"本设备同时只接受一个观看端"。
@@ -470,6 +555,142 @@ ADC 起振瞬态、设备 busy、整数秒对齐 —— 任何一个都会把结
   永远不关，板子一直以为还有观看端 —— 然后报"已有一个观看端，拒绝新的连接"，
   看起来完全像产品缺陷。
 
+### 7.8 检测线程里调 `GstVideo.VideoInfo.from_caps()`，收尾时 NPU 释放段错误
+
+这个坑的误导性在于：**现场看起来完全是 NPU 的问题**，可凶手是一个毫不相干的
+GStreamer 调用。
+
+现象：开着检测的会话一结束，agent 进程就没了（`EXIT=139`），日志尾巴上只有
+一屏 `gst_segment_to_running_time_full: assertion 'stop != -1' failed`，没有
+Python traceback；`/detect` 随后返回"连不上推送端"。视频/音频/遥操作在断开
+之前全部正常，所以很容易被当成"检查脚本把服务停了"。
+
+用 `PYTHONFAULTHANDLER=1` 重跑就能拿到现场：
+
+```
+Fatal Python error: Segmentation fault
+Thread … (most recent call first):
+  File "rknnlite/api/rknn_lite.py", line 273 in release
+  File "src/detect.py",   line … in release
+  File "src/session.py",  line … in _stop_on_glib
+```
+
+隔离实验（全部在板子上实跑过）：
+
+| 实验 | 结果 |
+|---|---|
+| 检测线程里 `from_caps()`，**一帧都不推理** | 收尾照炸 |
+| 主线程里 `from_caps()` 调 40 次，再 `release()` | 没事 |
+| 300 次推理（不碰 GStreamer），再 `release()` | 没事 |
+| 真管线 + 推理，把 `from_caps()` 换成从 buffer 大小推 stride | 连跑多轮不炸 |
+
+结论：**librknnrt 的 release 和 `from_caps()` 在非 GLib 线程里的调用**合在一起
+才会炸，和推理次数、模型都不相干；具体是 librknnrt 内部还是 PyGObject 的
+marshalling 就不值得再追了 —— 绕开它更便宜。
+
+修法：`frame_stride()` 从 buffer 大小反推（一帧 RGB 正好是 `stride*height`），
+检测线程完全不碰 GstVideo。判据是 `tools/check_detect.sh` 跑完 agent 还在，
+`tools/check_fd.sh` 连跑 3 轮都过；单条 `check_detect.py` 用真实的 GstSample
+覆盖这条路径。
+
+> 教训：**"报错的那一行不是凶手"**。段错误发生在 `release`，不代表原因在
+> NPU —— 用 faulthandler 拿 Python 栈，再用"最小可证伪差异"（加回/去掉
+> `from_caps`）逐段二分，比盯着 NPU 日志猜快得多。
+
+### 7.9 USB 摄像头重新枚举之后，`/dev/videoNN` 不再是原来那个
+
+现象：页面没画面，会话照建但 0 包；日志里没有明显的摄像头错误，只有 MIPI 的
+白平衡桥在喊"5 秒没等到帧"。`dmesg` 里能看到 USB 设备掉了一次又回来：
+
+```
+usb 3-1: cannot submit urb 0, error -19: no device
+usb 3-1: new high-speed USB device number 3 using ehci-platform
+usb 3-1: Found UVC 1.00 device Q8 HD Webcam (1bcf:2281)
+```
+
+UVC 摄像头会占**两个**节点（采集 + metadata），节点号由枚举顺序决定。重新枚举
+一次，`video20` 就没了，新节点变成 `video21`/`video22` —— 源表里写死的
+`/dev/video20` 从此指向不存在的设备。
+
+修法：USB 源用 udev 的稳定链接，不用裸节点号：
+
+```bash
+ls -l /dev/v4l/by-id/            # usb-<型号>-video-index0 -> ../../video21
+```
+
+`src/sources.py` 里 `usb.device` 就是这个 by-id 路径；重新枚举后链接自动指向新
+节点，`/camera` 的 `present` 也跟着对。**换不同型号的摄像头时要改这一行** ——
+链接名里带型号。
+
+> 另一件相关的事：重启后初始源默认是 mipi。板载 MIPI 排线有问题时，每次重启
+> 都是"页面又黑了"，还得再点一次切换 —— 在 `.env` 里写 `CAMERA_SOURCE=usb`
+> 把这一步省掉（`run-agent.sh` 会翻译成 `--camera-source`）。
+
+### 7.10 切完摄像头，videorate 有一阵子不按 fps 丢帧
+
+现象：开着检测切换摄像头之后，检测帧数按采集帧率涨（实测约 32 帧/秒，配置是
+5），持续十几秒才回到 5。`errors` 一直是 0，页面上的框也在更新 —— 唯一不对的
+就是 NPU 的占用是配置值的六倍，很容易被当成"检测就是这么费"。
+
+定位时先在**脱离 agent 的脚本**里用 `pipeline.segment_desc()` 建同一段采集链，
+把 `videorate` 的 src caps 打出来：正常时是 `framerate=(fraction)5/1`，appsink
+也是 ~5 帧/秒；问题只在"采集段被重建过"的那条链上出现。
+
+| 场景 | videorate 出口 |
+|---|---|
+| 建段时 valve 就开 / PLAYING 后再开阀（同一个段） | 都是 5/秒 |
+| 切源重建采集段（阀在重建后立刻开） | 前 ~19 秒按采集帧率全放行，之后 5/秒 |
+
+所以不是 caps 写错，是采集段重建后的协商时机问题。和 GStreamer 的这段时机
+较劲的性价比不高：限流本身只需要"推理不超过 fps"，而这个判据可以直接用墙钟
+时间做，与管线状态无关。
+
+修法在检测线程里兜底（`detect.too_soon()`）：距上一帧不足 `0.9 / fps` 秒就
+跳过，不推理。appsink 是 `max-buffers=1 drop=true`，多拉的那几帧丢掉不积压；
+`0.9` 是给 videorate 的正常抖动留的余量（实测它偶尔出 6 帧/秒）。第一次触发
+和之后每 500 帧会打一条警告，`/detect` 里的 `skipped` 是累计数：平时只有零星
+几个（videorate 的正常抖动），切源/开关之后会涨一截 —— 那也是同一个时机问题。
+**如果 `skipped` 长期和 `frames` 是同一量级**，说明上游限流彻底失效了。
+
+### 7.11 切到 MIPI 一片黑：检测的 appsink 把新采集段卡在 PAUSED
+
+现象：开着（或关着）检测，从 USB 切到 MIPI，页面一直黑屏、`video_packets_out`
+冻住、`detect_frames` 0；日志里只有一行
+
+```
+白平衡桥：5 秒没等到帧，线程收工（pipeline 照常跑，只是不再校正）
+```
+
+没有任何 GStreamer 报错。反证很干净：把 agent 停掉、同一个 `/dev/video11` 用
+`gst-launch-1.0 ... num-buffers=10 ! fakesink` 能出帧，dmesg 里 ISP 也一直
+`stream ON` —— 设备、排线、sensor 都没问题。
+
+定位靠 `GST_STATES`：换源时新采集段是 `sync_state_with_parent()` 单独接进
+**已经在 PLAYING** 的管线的，这时 bin 的状态迁移不再是"整条管线一起上"，
+而是**每个 sink 各自 preroll 完才算了事**。日志里 bin 的 PAUSED→PLAYING 返回
+`ASYNC`，`detsink` 一直 `changing state asynchronously`。
+
+`detsink` 前面那个 valve 默认关着（`drop=true`），它永远收不到第一帧，于是
+整个 bin 停在 PAUSED —— 连已经收到 preroll 的 `wbsink` 也不消费。mjpeg 源的
+主路不经过任何 appsink，照样出帧，所以"切 USB 好好的"；raw 源的主路是
+`wbsink →（桥线程）→ wbsrc`，`wbsink` 一停，桥线程就等不到帧，视频自然 0 包。
+**首段不受影响**（整条管线 NULL→PLAYING，live 源不要求 preroll），只有换源
+这条路会中招 —— 这也是它只在加检测旁路之后才出现的原因。
+
+| 场景 | 结果 |
+|---|---|
+| 首段直接以 MIPI 起（NULL→PLAYING 一次上去） | 正常 |
+| 换源到 MIPI，`detsink` 默认（`async=true`） | bin 停在 PAUSED，桥 5 秒超时，0 包 |
+| 换源到 MIPI，`detsink async=false` | 立刻出帧（前 15 帧自校准都跑完） |
+| 换源到 MIPI，`detsink` + `wbsink` 都 `async=false` | 同样正常，不必要 |
+
+修法：`detsink` 加 `async=false`。检测本来就不需要 preroll（有帧就拉、没有就
+等），关掉没有副作用；`wbsink` 保留默认，因为它确实要等第一帧 —— 摄像头真的
+不出帧时，让段停在 PAUSED 比假装在播更接近事实。
+
+**这类"换源才出现、首段正常"的问题，先怀疑异步状态机，别先怀疑设备。**
+判据是 `GST_STATES` 里那个 `ASYNC`，不是日志里有没有 ERROR（这次一条都没有）。
+
 ---
 
 ## 八、怎么证明它真的在工作
@@ -486,6 +707,9 @@ ADC 起振瞬态、设备 busy、整数秒对齐 —— 任何一个都会把结
 | 每条命令都有回执（`sent == acked + nacked`） | 防丢一条命令被当成"页面没发" |
 | 板端 `teleop_overlay` 跟得上 ACK | 防 ACK 是真的、画面那道环是假的 |
 | 板端 `teleop_rx` 与页面 `sent` 对得上 | 防页面自说自话（自己发的、自己记的） |
+| 检测开启后 `frames` 涨、关闭后停 | 防"POST 成功了"被当成"NPU 真的在跑/真的停了" |
+| 检测会话拆掉后 agent 还活着（不是 `EXIT=139`） | 防"检测跑通了"被当成"收尾没问题"——段错误只在拆会话那一刻发作（7.8） |
+| `/detect` 的 `skipped` 只零星涨，不和 `frames` 同量级 | 防上游限流失效（切源后 videorate 会放行一阵），NPU 被按 6 倍占用却没人发现（7.10） |
 
 ### 三个验收工具
 
@@ -496,6 +720,12 @@ python3 tools/analyze_diag.py --url https://<信令服务器> --room <房间> \
 
 # 切换摄像头：13 条（设备侧证明"那一段真的换了"，浏览器侧证明"解出来的是新画面"）
 tools/check_switch.sh --base https://<板子>:8443
+
+# 人像检测：可用性 → 开启后帧数在涨 → 关闭后帧数停住
+tools/check_detect.sh --base https://<板子>:8443
+
+# 检测后处理单测（宿主机）；在板子上加 --model 跑一次真实推理
+python3 tools/check_detect.py
 
 # 会话拆除后设备 fd 有没有还回去（**在板子上跑**，它要读本机 /proc）
 tools/check_fd.sh --cycles 3
@@ -605,6 +835,9 @@ VPS 上：`sudo bash tools/deploy_vps.sh` 装 coturn，并生成
 | `--gop` | 10 | 切换后最多等一个 GOP 才出新画面。20fps 下约 0.5 秒 |
 | 分辨率 | 1280x720 | 两路一致是"切换不用重新协商"的前提 |
 | 码率 | 2500 kbps | MIPI 的 UYVY 走 rkisp 的吞吐上限约 20.4 fps —— 不是 CPU 也不是编码器（MPP 是硬编） |
+| `--detect-fps` | 5 | 检测支路在 `videorate` 里限帧；主路仍是 20 fps，互不影响 |
+| 检测输入 | 640×360 | 16:9 不补边，`letterbox` 到 640×640 后正好上下各补 140 |
+| 检测 `valve` | 默认关 | 没开检测时支路零 buffer，空闲成本约等于零 |
 
 ---
 
@@ -619,6 +852,9 @@ VPS 上：`sudo bash tools/deploy_vps.sh` 装 coturn，并生成
 - **USB 摄像头不上 1080p**：会破坏"切换不用重新协商"的前提。
 - **阶段三的"执行"是模拟的**：原始约束就是"只需要做文字命令演示，不需要实际操作"，
   但**结果是看得见的**（画面里出现那行字）。
+- **检测框不烧进视频流**：走页面叠加层，保证录像/截图是干净画面。要烧录得改采集段
+  （见第五节的取舍），不是改页面。
+- **检测只做"人"这一类，只显示不告警**：框和人数，没有录像、没有推送。
 
 ---
 

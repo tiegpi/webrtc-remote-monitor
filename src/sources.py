@@ -57,7 +57,12 @@ SOURCES = (
     CameraSource(
         name="usb",
         label="USB 摄像头",
-        device="/dev/video20",
+        # **别写 /dev/videoNN。** 这颗摄像头掉过一次线（USB 重新枚举），
+        # 节点从 video20 变成了 video21；写死节点的结果是页面没画面、
+        # 会话照建但 0 包，日志里只有 MIPI 的白平衡桥"5 秒没等到帧" ——
+        # 离真正的原因很远。by-id 链接是 udev 按设备型号生成的，重新枚举后
+        # 自动指向新节点；换别的型号时这里要跟着改。
+        device="/dev/v4l/by-id/usb-GH-250528-Y_Q8_HD_Webcam-video-index0",
         kind="mjpeg",
         fourcc="MJPG",
         # 这颗自带 AE/AWB（实测能到 Y=226），**兜底反而要跳过** ——

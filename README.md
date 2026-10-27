@@ -50,6 +50,9 @@ an explicit "device busy" status instead of kicking the first viewer off.
   and the command is rendered into the video stream itself (`CMD #7 FORWARD 10 ...`
   in the top-left corner). The text can only come from the board, so it proves both
   the control path and the media path in one glance.
+- **Person detection on the NPU** — YOLOv5s on the RK3588 NPU at 5 fps, boxes and count
+  drawn over the page; the video stream itself stays clean. Optional: a missing model
+  only greys out the button.
 - **LAN and public deployment from the same code** — a single `signal_server.py` runs
   on the board for LAN-only mode or on a VPS with coturn for WAN access.
 
@@ -132,6 +135,28 @@ that *look* like success:
 | `sent == acked + nacked` | A dropped command mistaken for "the page never sent it" |
 | Board-side `teleop_overlay` tracks ACKs | A truthful ACK over a dead video path |
 | Board-side `teleop_rx` matches page-side `sent` | The page grading its own homework |
+| Detection `frames` rise while on, stop when off | "POST succeeded" mistaken for "the NPU is running" |
+
+### 4. Person detection on the NPU, boxes drawn by the page
+
+The RK3588 NPU runs a YOLOv5s RKNN model at 5 fps off a `valve`-gated branch after
+`textoverlay`. The branch's queue is `leaky`, so a slow NPU can never back-pressure
+the encoder, and the valve is closed by default — detection costs nothing while it
+is off. Results travel over the existing teleop DataChannel as normalized boxes; the
+page draws them on a canvas above the `<video>`.
+
+- **Nothing is burned into the video stream.** The overlay is page-side, so recorded
+  or screenshot frames stay clean and toggling detection never touches the encoder.
+  (Burn-in with `cairooverlay` is the alternative; it changes the capture segment,
+  not the page.)
+- **No OpenCV.** `cv2` and numpy 2.x do not coexist on this image, so letterbox,
+  anchor decode, NMS and normalization are plain numpy — and unit-tested on the host
+  against synthetic tensors (`tools/check_detect.py`).
+- **Coordinates are normalized** (`x,y,w,h ∈ [0,1]`), so the page does not need to know
+  the camera resolution or its own CSS size.
+- **Lifecycle follows the fd invariant.** The detector thread stops *before* the old
+  capture segment is torn down; the NPU context is released before the pipeline is
+  disposed; camera switches rebind the detector to the new segment's `appsink`.
 
 ## Measured results
 
@@ -160,6 +185,11 @@ sudo apt install python3-gi python3-aiohttp python3-numpy \
 ```
 
 `numpy` is only needed for `--camera-wb`; see [requirements.txt](requirements.txt).
+
+Person detection additionally needs `rknn-toolkit-lite2` (shipped with most vendor
+images) and a YOLOv5s `.rknn` model. Both are optional: without them the page's
+detection button is disabled and video is unaffected. The model is not in the repo —
+see [Known limitations](#known-limitations).
 
 ### LAN only (no VPS)
 
@@ -298,6 +328,11 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDI
 | `SIGNAL_HOST` | VPS public IP / hostname | your VPS |
 | `SIGNAL_AUTH` | `user:pass` for `/ice.json`, `/diag`, `/ws/view` | printed by `deploy_web_vps.sh` |
 
+Optional: `CAMERA_SOURCE=usb` makes the agent start on the USB camera instead of
+MIPI (with a dead MIPI ribbon cable, every restart otherwise comes up on a black
+source until you switch in the page). The `DETECT*` variables are documented in
+`.env.example`.
+
 #### 4. Start / stop (board)
 
 ```bash
@@ -359,6 +394,9 @@ routing, and why `/ws/publish` deliberately stays outside Basic Auth.
 | `--camera-ctl analogue_gain=176,exposure=1648` | Write sensor controls directly, no closed loop |
 | `--ice-policy relay` | Force TURN; used to prove the relay path actually works |
 | `--no-audio` | Video-only mode for boards without a usable microphone |
+| `--detect` | Start with detection on (default off; the page toggles it) |
+| `--detect-model PATH` | YOLOv5s `.rknn` file; defaults to the vendor image path |
+| `--detect-fps 5` / `--detect-conf 0.35` | Detection branch rate and confidence threshold |
 
 ## Verification
 
@@ -373,8 +411,14 @@ bash tools/check_switch.sh --base https://<board>:8443
 # Device fds returned after session teardown (run on the board)
 bash tools/check_fd.sh --cycles 3
 
+# Person detection: availability → frames rise while on → frames stop when off
+bash tools/check_detect.sh --base https://<board>:8443
+
 # Protocol unit tests, no GStreamer required
 python3 tools/check_teleop.py
+
+# Detection post-processing (host; add --model on the board for one real inference)
+python3 tools/check_detect.py
 
 # Signaling/server regressions: busy paths, viewer routing/isolation, lifecycle
 # marshaling — no hardware required
@@ -423,6 +467,7 @@ src/
   signal_server.py   signaling + /ice.json + diagnostics (LAN or VPS, same file)
   web_server.py      page server + same-origin proxy (/ws/view, /ice.json, /diag, /camera)
   teleop.py          command protocol: whitelist, validation, ACK/NACK, overlay text
+  detect.py          person detection: RKNN thread + numpy-only post-processing
   sdpview.py         SDP → human-readable media sections (shared by tools)
 web/
   monitor.html       the whole viewer UI: one file, no build step
@@ -434,6 +479,8 @@ tools/
   deploy_web_vps.sh VPS: page service + nginx routes
   gen_cert.sh       board self-signed certificate
   analyze_diag.py   main acceptance criteria
+  check_detect.py   detection post-processing unit tests (+ optional live inference)
+  check_detect.sh   /detect toggle: frames rise while on, stop when off
 docs/architecture.md  the deep dive: topology, threads, and every silent failure
 ```
 
@@ -457,6 +504,12 @@ docs/architecture.md  the deep dive: topology, threads, and every silent failure
   (a few hundred KB per session). See `docs/architecture.md §11`.
 - **MIPI quality is sensor-bound.** The loop can only reach Y≈78 in a dim room; more
   light or a different sensor is the only real fix.
+- **The detection model is not committed.** YOLOv5 code and weights are AGPL-3.0, and
+  a converted `.rknn` is tied to the toolkit/board version; the MIT license covers the
+  code in this repo only. Point `--detect-model` at your own file.
+- **Detection boxes are page-side only.** A client that does not run the page (raw
+  RTP, recording on the board) sees clean video. Burn-in would move this into the
+  capture segment.
 
 ## License
 

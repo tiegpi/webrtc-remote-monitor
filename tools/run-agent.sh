@@ -44,6 +44,27 @@ if [ -f .env ]; then . ./.env; fi
 # WebSocket 仍然只认 TOKEN，不要混用。
 : "${SIGNAL_AUTH:?没设 SIGNAL_AUTH（user:pass）—— 见 .env.example}"
 
+# 初始视频源（mipi / usb）。默认 mipi —— 但板载 MIPI 排线坏了的时候，
+# 每次重启都回到 mipi 就是"页面又是黑的"，还得再点一次切换。写在 .env 里：
+#   CAMERA_SOURCE=usb
+CAMERA_ARGS=()
+if [ -n "${CAMERA_SOURCE:-}" ]; then CAMERA_ARGS+=(--camera-source "$CAMERA_SOURCE"); fi
+
+# 人像检测（阶段四）的三个参数都是可选的，写在 .env 里而不是这个脚本里：
+# 模型路径因板子而异，钉在仓库里就会在另一块板子上指向不存在的文件。
+# 不设就用 device_agent.py 的默认值；模型不在时页面上的按钮置灰，
+# 视频照常，不影响推流。
+#
+#   DETECT=1          启动时就开着检测（默认关，由页面点开）
+#   DETECT_MODEL=...  .rknn 文件路径
+#   DETECT_FPS=5      检测帧率上限
+#   DETECT_CONF=0.35  置信度阈值
+DETECT_ARGS=()
+if [ "${DETECT:-0}" = "1" ]; then DETECT_ARGS+=(--detect); fi
+if [ -n "${DETECT_MODEL:-}" ]; then DETECT_ARGS+=(--detect-model "$DETECT_MODEL"); fi
+if [ -n "${DETECT_FPS:-}" ]; then DETECT_ARGS+=(--detect-fps "$DETECT_FPS"); fi
+if [ -n "${DETECT_CONF:-}" ]; then DETECT_ARGS+=(--detect-conf "$DETECT_CONF"); fi
+
 exec python3 src/device_agent.py \
   --signal "wss://$SIGNAL_HOST/ws/publish" \
   --room "$ROOM" \
@@ -51,4 +72,6 @@ exec python3 src/device_agent.py \
   --signal-auth "$SIGNAL_AUTH" \
   --tls-ca certs/vps-self.crt \
   --camera-wb auto \
+  ${CAMERA_ARGS[@]+"${CAMERA_ARGS[@]}"} \
+  ${DETECT_ARGS[@]+"${DETECT_ARGS[@]}"} \
   "$@"

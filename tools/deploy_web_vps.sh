@@ -29,6 +29,7 @@
 #       其余观看相关路径          → Basic Auth 之后才转发
 #       /webrtc                  → 127.0.0.1:8444（观看页）
 #       /config.json /camera     → 127.0.0.1:8444
+#       /detect                  → 127.0.0.1:8444
 #       /ws/view /diag /ice.json → 127.0.0.1:8443
 #       其他一切                  → 404
 #   两个上游都只监听回环，外网够不到。
@@ -37,7 +38,7 @@
 #
 # 访问控制（2026-10-17 增加）:
 #   外网 IP 是公开的，仅靠"路径不好猜"不算权限。观看页、/config.json（房间号）、
-#   /ice.json（TURN 凭证）、/diag、/camera、/ws/view 全部要求 HTTP Basic Auth；
+#   /ice.json（TURN 凭证）、/diag、/camera、/detect、/ws/view 全部要求 HTTP Basic Auth；
 #   根路径 / 直接 404，不再 302 到 /webrtc，避免把入口暴露给任何知道 IP 的人。
 #   凭证首次部署时随机生成并打印，之后复用；可用 VIEW_USER / VIEW_PASS 覆盖：
 #       VIEW_PASS='...' bash tools/deploy_web_vps.sh
@@ -50,8 +51,9 @@
 #   所以板子 .env 里必须写同一组凭证：SIGNAL_AUTH=user:pass。换密码时两边都要改。
 #
 # 已知限制（不是漏了，是拓扑决定的）:
-#   /camera 在 VPS 上找不到 device_agent 的 unix socket，会明确返回 502，
-#   页面上表现为"取摄像头列表失败，不显示切换按钮"。视频/语音不受影响。
+#   /camera、/detect 在 VPS 上找不到 device_agent 的 unix socket，会明确返回 502，
+#   页面上表现为"取摄像头列表失败，不显示切换按钮"、"取检测状态失败"。
+#   视频/语音不受影响。
 #   要支持公网切摄像头，得让板子主动开一条 SSH 反向 unix socket 隧道到 VPS，
 #   属于另一件事，见 docs/architecture.md 的说明。
 set -euo pipefail
@@ -183,7 +185,7 @@ UNIT
 
 # ---------------------------------------------------------------- 观看页
 # RuntimeDirectory 会建 /run/webrtc-web（属主 webrtc）。现在里面没有
-# agent.sock，所以 /camera 会 502；将来若给板子开反向隧道，socket 放这里。
+# agent.sock，所以 /camera、/detect 会 502；将来若给板子开反向隧道，socket 放这里。
 # --web-dir 显式指到平铺目录，不依赖相对路径的默认解析。
 cat > /etc/systemd/system/webrtc-web.service <<'UNIT'
 [Unit]
@@ -215,12 +217,12 @@ UNIT
 #   /ws/publish                → 8443（推流端，token 鉴权，不套 Basic Auth）
 #   /ws/view /diag /ice.json   → 8443（观看端，Basic Auth）
 #   /webrtc /monitor.html      → 8444（观看页，Basic Auth）
-#   /config.json /camera       → 8444（Basic Auth）
+#   /config.json /camera /detect → 8444（Basic Auth）
 #   /                          → 404（不再重定向，不向陌生人暴露入口）
 #   其他一切                    → 404
 #
 # 为什么入口用**不带结尾斜杠**的 /webrtc：
-#   页面里的 fetch("./config.json")、"./camera"、"./ice.json"、"./diag" 都是相对 URL。
+#   页面里的 fetch("./config.json")、"./camera"、"./detect"、"./ice.json"、"./diag" 都是相对 URL。
 #   浏览器对 /webrtc 的基准目录是 /，这些请求会落到 /config.json 等根路径；
 #   如果入口是 /webrtc/，它们会变成 /webrtc/config.json，那些路径没有对应路由。
 #   所以 /webrtc 是规范形式，/webrtc/ 统一 301 回来。
@@ -334,7 +336,7 @@ location = / {
     return 404;
 }
 
-# 页面里的相对路径（./config.json、./camera）落到这里。
+# 页面里的相对路径（./config.json、./camera、./detect）落到这里。
 location = /config.json {
     auth_basic "webrtc monitor";
     auth_basic_user_file /etc/nginx/webrtc-view.htpasswd;
@@ -347,6 +349,19 @@ location = /config.json {
 }
 
 location = /camera {
+    auth_basic "webrtc monitor";
+    auth_basic_user_file /etc/nginx/webrtc-view.htpasswd;
+    proxy_pass http://127.0.0.1:8444;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# 人像检测开关。和 /camera 一样是本地控制端点：VPS 上没有 agent socket，
+# 会明确 502。局域网页面直连板子的 web_server，走的是板子上的同一个路由。
+location = /detect {
     auth_basic "webrtc monitor";
     auth_basic_user_file /etc/nginx/webrtc-view.htpasswd;
     proxy_pass http://127.0.0.1:8444;
@@ -479,9 +494,11 @@ if [ "$CREDS_KNOWN" = 1 ]; then
         "auth_ok https://127.0.0.1/config.json | grep -q room"
     check "443 /ice.json 登录后有 TURN 凭证" \
         "auth_ok https://127.0.0.1/ice.json | grep -q turn"
-    # /camera 在 VPS 上没有 agent socket，必须是一个**明确的** 502。
+    # /camera、/detect 在 VPS 上没有 agent socket，必须是**明确的** 502。
     check "443 /camera 登录后 502（预期）" \
         "auth_code_is https://127.0.0.1/camera 502"
+    check "443 /detect 登录后 502（预期）" \
+        "auth_code_is https://127.0.0.1/detect 502"
 else
     echo "  [SKIP] 明文密码未知，跳过登录后的正向验证"
 fi

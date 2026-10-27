@@ -67,6 +67,15 @@ PT_AUDIO = 111
 # 采集/播放两端都支持 48k，中间一次重采样都不要。
 AUDIO_RATE = 48000
 
+# 人像检测旁路（阶段四）。检测只需要看，不需要高帧率：
+#   · 5fps 下 NPU 单帧 ~30ms，只占单核约 15%；
+#   · 帧小一点（640x360）缩放/转换便宜，也足够 YOLOv5 的 640 输入；
+#   · 归一化坐标和分辨率解耦，页面按画布尺寸画框。
+# 尺寸必须和 detect.py 的稳定输出保持一致 —— 换这里也要确认检测链路仍能协商。
+DETECT_W = 640
+DETECT_H = 360
+DETECT_FPS_DEFAULT = 5
+
 
 # --------------------------------------------------------------------------- #
 # 小工具
@@ -144,6 +153,20 @@ def video_tail(a):
     ).format(pt=PT_VIDEO)
 
 
+def _detect_fps(a):
+    """检测旁路的采样率，夹在 1~15。
+
+    上限 15 不是因为 NPU 跑不动（30 也跑得动），而是这条旁路的价值随帧率
+    边际递减：监控场景里 5fps 已经够看清人，再高只是白烧 CPU/NPU。
+    传 0 或负数会让 videorate 的 caps 非法，所以这里统一夹住。
+    """
+    try:
+        fps = int(getattr(a, "detect_fps", DETECT_FPS_DEFAULT))
+    except (TypeError, ValueError):
+        fps = DETECT_FPS_DEFAULT
+    return max(1, min(15, fps))
+
+
 def segment_desc(a, src):
     """可替换的**采集段**：v4l2src → 硬件 H.264 → h264parse。
 
@@ -178,6 +201,15 @@ def segment_desc(a, src):
         "font-desc=\"DejaVu Sans 20\" halignment=left valignment=top "
         "shaded-background=true deltax=16 deltay=12 ! "
         #
+        # 人像检测旁路（阶段四）在这里分叉：主路照旧编码，旁路降采样给
+        # Python 检测线程。放在 textoverlay **之后**是刻意的 —— 检测看到的是
+        # 浏览器最终看到的画面；那点角落文字不影响人体检测。
+        #
+        # tee 的每个分支都必须跟一个 queue，否则一路慢会拖住另一路。
+        # 主路放在前面、带自己的 queue，保证编码器不被检测旁路卡住。
+        "tee name=vtap "
+        "vtap. ! queue ! "
+        #
         # profile/level 必须显式写。mpph264enc 默认给的是 High profile
         # (profile-level-id=640028)，浏览器多半直接拒收；写成 baseline+31
         # 得到 42c01f（Constrained Baseline 3.1），Chrome/Firefox 都认。
@@ -188,8 +220,41 @@ def segment_desc(a, src):
         # gop：关键帧间隔。这个值不能省，因为 config-interval=-1 只在**确实有
         # 关键帧**时才有用，否则中途加入的浏览器永远等不到 SPS/PPS，表现是一直黑屏。
         "mpph264enc profile=baseline level=31 gop={gop} bps={bps} rc-mode=cbr ! "
-        "h264parse name=vtail"
-    ).format(gop=a.gop, bps=a.bitrate)
+        "h264parse name=vtail "
+        #
+        # 检测旁路。valve 默认关（drop=true）：不开检测时，帧到这里就被丢掉，
+        # 后面的 videorate/videoscale/videoconvert 完全不工作，CPU 开销接近 0。
+        # 页面点开关时 session 只改这个 valve 的 drop 属性，不需要重建采集段。
+        #
+        # 顺序不能换：**先 videorate 再缩放/转换**。videorate 在 30fps 入口上
+        # 便宜地丢到 5fps，后面几步只处理 5fps；反过来会按 30fps 做全量转换。
+        #
+        # videoscale 不能省：videoconvert **不做缩放**，直接写
+        # `videoconvert ! video/x-raw,width=640` 会在链路上 not-negotiated。
+        # （板子上实测过，症状是 v4l2src 报 Internal data stream error，
+        #  和摄像头本身没关系。）
+        "vtap. ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 "
+        "leaky=downstream ! "
+        "valve name=dvalve drop=true ! "
+        "videorate ! video/x-raw,framerate={dfps}/1 ! "
+        "videoscale ! video/x-raw,width={dw},height={dh} ! "
+        "videoconvert ! video/x-raw,format=RGB ! "
+        #
+        # async=false **不能省**，理由和上面那些不是一个量级的问题：
+        # 换源时新段是单独 sync_state_with_parent() 接进已 PLAYING 的管线的，
+        # 这时 bin 的状态迁移会退化成"每个 sink 各自 preroll 完才算到 PLAYING"。
+        # 而 detsink 前面那个 valve 默认是关的（drop=true），它**永远收不到
+        # 第一帧**，于是异步迁移永远挂在那里、整个 bin 停在 PAUSED。mjpeg 源
+        # 的主路不经过任何 appsink，照样出帧，看不出问题；raw 源（mipi）的主路
+        # 是 wbsink →（桥线程）→ wbsrc，wbsink 也停在 PAUSED 上不消费，
+        # 症状就只有一句"白平衡桥：5 秒没等到帧"，视频 0 包、检测 0 帧。
+        # 实测：GST_STATES 里 bin 的 PAUSED→PLAYING 返回 ASYNC、detsink 一直
+        # "changing state asynchronously"；同一段给 detsink 加 async=false，
+        # 桥立刻开始出帧（前 15 帧自校准都跑完了）。
+        # 检测本来就不需要 preroll（frame 到了就拉，没有就等），关掉只有好处。
+        "appsink name=detsink max-buffers=1 drop=true sync=false async=false"
+    ).format(gop=a.gop, bps=a.bitrate,
+             dfps=_detect_fps(a), dw=DETECT_W, dh=DETECT_H)
 
     if src.kind != "raw" or not getattr(a, "camera_wb", None):
         return head + tail
@@ -509,6 +574,18 @@ class VideoSegment:
         if self.overlay is None:
             raise RuntimeError("采集段里没有 teleop 叠加层（描述串写错了？）：%s" % desc)
 
+        # 检测旁路的两个把手：valve 控制开关，appsink 是检测线程的输入。
+        # 它们同样随采集段重建，session 换源后要重新绑定（_bind_detect）。
+        #
+        # **调到这里之前 GstApp 必须已经 import**（detect.prepare_appsink），
+        # 否则 get_by_name 拿到的 detsink 是个没有 try_pull_sample 的秃 Element。
+        self.dvalve = self.bin.get_by_name("dvalve")
+        if self.dvalve is None:
+            raise RuntimeError("采集段里没有 dvalve（描述串写错了？）：%s" % desc)
+        self.detsink = self.bin.get_by_name("detsink")
+        if self.detsink is None:
+            raise RuntimeError("采集段里没有 detsink（描述串写错了？）：%s" % desc)
+
         # ghost 必须在**还没接进骨架**的时候建：Gst.GhostPad.new() 断言目标 pad
         # 未连接（"assertion '!gst_pad_is_linked (target)' failed"，实测）。
         # 所以顺序永远是 先 parse 出独立 bin → 再 ghost → 最后才 link 到 vpay。
@@ -587,6 +664,16 @@ class VideoSwitch:
     def overlay(self):
         """当前采集段里的 textoverlay 元素。换段之后指向新的那个。"""
         return self.current.overlay if self.current is not None else None
+
+    @property
+    def detsink(self):
+        """当前采集段里的检测 appsink。换段之后指向新的那个。"""
+        return self.current.detsink if self.current is not None else None
+
+    @property
+    def dvalve(self):
+        """当前采集段里的检测阀门。换段之后指向新的那个。"""
+        return self.current.dvalve if self.current is not None else None
 
     def attach_first(self, src):
         """接上第一个采集段。**不** sync 状态 —— 由 session.start() 的

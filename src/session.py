@@ -42,6 +42,7 @@ gi.require_version("GstWebRTC", "1.0")
 
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
+import detect
 import pipeline
 import sources
 import teleop
@@ -104,7 +105,8 @@ class DeviceSession:
     发送那一步是唯一的差异点。
     """
 
-    def __init__(self, send_fn, loop, args, ice=None, source=None):
+    def __init__(self, send_fn, loop, args, ice=None, source=None,
+                 detect_enabled=False):
         self.send_fn = send_fn
         self.loop = loop                 # asyncio 事件循环，用于跨线程投递
         self.args = args
@@ -139,6 +141,20 @@ class DeviceSession:
         self.last_teleop_seq = None
         self.last_teleop_cmd = None
 
+        # 人像检测（阶段四）。detector 是 NPU 上下文 + 拉帧线程；没有开启时是
+        # None，不占 NPU、也不加载模型。开关状态跟着**进程**走（AgentState），
+        # 会话重建时按 detect_enabled 重新建。
+        self.detector = None
+        # detect_enabled 是**实际**状态（线程在跑、valve 开着）；_detect_requested
+        # 是用户意图，跨"换摄像头/会话重建"保留。两者分开，启动时才不会因为
+        # 构造函数里已经写成 True 而跳过真正的启动步骤。
+        self.detect_enabled = False
+        self._detect_requested = bool(detect_enabled)
+        self.detsink = None              # 当前采集段里的检测 appsink
+        self.dvalve = None               # 当前采集段里的检测阀门
+        self.n_detect_sent = 0           # 成功交给 DataChannel 的条数
+        self.n_detect_dropped = 0        # 通道没开/发送失败丢掉的条数
+
         # 统计量。读它们的是 1Hz 遥测和 tools/analyze_diag.py。
         # RTP 包在**探针回调里**计数，那个回调跑在 streaming 线程上，
         # 所以这里只做自增，不做任何分配或加锁。
@@ -161,6 +177,14 @@ class DeviceSession:
         _call_on_glib(self._start_on_glib, "启动会话")
 
     def _start_on_glib(self):
+        # GstApp 必须赶在 parse 之前 import，否则 detsink 会被包成没有
+        # try_pull_sample 的秃 Element（和 whitebalance 是同一个坑）。
+        # 失败不阻断视频，只是检测用不了。
+        try:
+            detect.prepare_appsink()
+        except RuntimeError as exc:
+            log.warning("人像检测不可用：%s", exc)
+
         self.pipeline, self.webrtcbin, self.switch = pipeline.build(
             self.args, self.ice, log, self.source,
             on_audio_elements=self._on_audio_elements)
@@ -168,6 +192,7 @@ class DeviceSession:
         # 叠加层在当前采集段那个 bin 里。换摄像头时整段会重建，
         # 所以 switch_source() 里必须再绑一次（见那里的 finally）。
         self._bind_overlay()
+        self._bind_detect()
 
         # 顺序有讲究：先接 on-ice-candidate / on-negotiation-needed，
         # 再 set_state(PLAYING)。反过来的话首次协商会因为没人接
@@ -197,6 +222,11 @@ class DeviceSession:
         # 线程会立刻判定"流结束了"自己收工，白平衡就静默失效了。
         self.switch.start_bridges()
 
+        # 开关是"跟着进程走"的：上次观看端开过检测，这次接入的会话直接开启。
+        # 模型/依赖不可用时只告警，视频照常。
+        if self._detect_requested and not self._apply_detect(True):
+            self._detect_requested = False
+
         log.info("pipeline 已启动，等待协商…")
 
     def stop(self):
@@ -210,6 +240,16 @@ class DeviceSession:
         if self.stopped:
             return
         self.stopped = True
+
+        # 检测收尾必须赶在拆 pipeline 之前：先让线程松手、再放 NPU 上下文，
+        # 最后才让采集段进 NULL。反过来会让旧 appsink 的 buffer 拖住旧段的
+        # buffer pool（fd 泄漏那条已知链路）。
+        if self.detector is not None:
+            self.detector.release()
+            self.detector = None
+        self.detect_enabled = False
+        self.detsink = None
+        self.dvalve = None
 
         # 遥操作收尾：让 2 秒清空定时器失效，摘掉 DC 回调，再放掉引用。
         # 顺序在拆 pipeline 之前 —— 通道对象属于 webrtcbin，拆完再碰它就是在
@@ -276,6 +316,14 @@ class DeviceSession:
             # 还没有会话（没有观看端）时只记住选择，等建 pipeline 时用它。
             self.source = sources.resolve(name)
             return self.source.name
+
+        # 旧 appsink 马上就要被 NULL + 拆掉，检测线程必须先松手。反过来的话，
+        # 线程手里可能还攥着旧段 buffer 的引用，会把旧 buffer pool 拖到析构不了
+        # —— 正是项目里 fd 泄漏那条已知链路。stop() 的拉帧超时只有 100ms，
+        # 卡不住 GLib 线程。
+        if self.detector is not None:
+            self.detector.stop()
+
         try:
             applied = self.switch.switch(name)
             self.source = self.switch.source
@@ -285,6 +333,21 @@ class DeviceSession:
             # 不重绑的话：命令照常 ACK、计数照常涨，画面里却再也不出字 ——
             # 这是最像"链路还活着"的一种坏法，必须在这里收掉。
             self._bind_overlay()
+            self._bind_detect()
+
+            # 检测开着的话，把线程重新挂到**新**采集段的 appsink 上。
+            # 新段的 valve 默认是关的，要显式再打开。
+            if self.detect_enabled:
+                if (self.detector is not None and self.detsink is not None
+                        and self.dvalve is not None):
+                    self.dvalve.set_property("drop", False)
+                    self.detector.start(self.detsink, self._on_detect_result)
+                else:
+                    log.warning("检测：换源后找不到新的采集段，先关掉开关")
+                    self.detect_enabled = False
+                    self._detect_requested = False
+                    self._dc_send({"t": "det", "on": False,
+                                   "ts": round(time.time(), 3)})
 
     # ---------------- 统计探针 ----------------
     def _attach_counters(self):
@@ -392,6 +455,14 @@ class DeviceSession:
         video_source / video_switches 是"板子真的换了那一段"的设备侧判据 ——
         浏览器那边的画面变化可以被很多原因解释，这两个数是直接证据。
         """
+        if self.detector is not None:
+            det = self.detector.stats()
+        else:
+            det = {
+                "detect_frames": 0, "detect_errors": 0, "detect_skipped": 0,
+                "detect_last_ms": 0.0, "detect_last_n": 0,
+                "detect_last_ts": 0.0, "detect_last_error": "",
+            }
         return {
             "video_packets_out": self.n_packets_out,
             "video_bytes_out": self.n_bytes_out,
@@ -409,6 +480,12 @@ class DeviceSession:
             "teleop_overlay": self.n_teleop_overlay,
             "teleop_last_seq": self.last_teleop_seq,
             "teleop_last_cmd": self.last_teleop_cmd,
+            # 人像检测：frames/errors/耗时是板子侧的真实计数。页面只负责画框，
+            # 这些数证明检测确实在跑，而不是页面自己编的。
+            "detect_enabled": bool(self.detect_enabled),
+            "detect_sent": self.n_detect_sent,
+            "detect_dropped": self.n_detect_dropped,
+            **det,
         }
 
     # ---------------- GStreamer 总线 ----------------
@@ -525,6 +602,113 @@ class DeviceSession:
         if self.pipeline is not None and self.overlay is None:
             log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
 
+    # ---------------- 人像检测（阶段四） ----------------
+    def _bind_detect(self):
+        """把检测旁路的两个把手指向**当前**采集段。
+
+        和 _bind_overlay 一样：换摄像头会重建采集段，旧的 appsink/valve 随之
+        销毁。这里只重绑引用；如果检测正开着，switch_source 会在重绑之后把
+        检测线程重新挂到新的 appsink 上。
+        """
+        self.detsink = self.switch.detsink if self.switch is not None else None
+        self.dvalve = self.switch.dvalve if self.switch is not None else None
+
+    def _ensure_detector(self):
+        """懒加载模型。只在真正要开检测时调用 —— 没开检测就不占 NPU。"""
+        if self.detector is not None:
+            return True
+        try:
+            detect.prepare_appsink()
+        except RuntimeError as exc:
+            log.warning("人像检测不可用：%s", exc)
+            return False
+        model = getattr(self.args, "detect_model", detect.MODEL_DEFAULT)
+        fps = getattr(self.args, "detect_fps", 5)
+        conf = getattr(self.args, "detect_conf", detect.CONF_DEFAULT)
+        try:
+            self.detector = detect.Detector(model, fps=fps, conf=conf)
+        except detect.DetectUnavailable as exc:
+            log.warning("人像检测不可用：%s", exc)
+            return False
+        log.info("人像检测模型已加载：%s（%d fps，conf %.2f）", model, fps, conf)
+        return True
+
+    def _apply_detect(self, enabled):
+        """开启/关闭检测。**只能在 GLib 线程调用。**
+
+        开关只改 valve 和检测线程，不重建采集段、不重新协商 —— 视频流不会因为
+        点一下检测按钮而停顿。返回是否达到目标状态。
+        """
+        enabled = bool(enabled)
+        if enabled == self.detect_enabled:
+            return True
+
+        if enabled:
+            if self.detsink is None or self.dvalve is None:
+                log.warning("检测：当前没有采集段，开关将在下次建立会话时生效")
+                return False
+            if not self._ensure_detector():
+                return False
+            if not hasattr(self.detsink, "try_pull_sample"):
+                # GstApp 没在 parse 之前 import，包装类型换不回来了。
+                log.error("检测：detsink 不是 AppSink —— GstApp 的 import 顺序错了")
+                return False
+            # 先开 valve 再起线程：反过来线程会在没有数据时白等一轮。
+            self.dvalve.set_property("drop", False)
+            self.detector.start(self.detsink, self._on_detect_result)
+            self.detect_enabled = True
+            log.info("人像检测已开启（%d fps）", self.detector.fps)
+        else:
+            if self.detector is not None:
+                self.detector.stop()
+            if self.dvalve is not None:
+                self.dvalve.set_property("drop", True)
+            self.detect_enabled = False
+            log.info("人像检测已关闭")
+
+        # 开关本身也告诉页面一声：让它不用等下一帧就更新按钮/状态。
+        self._dc_send({"t": "det", "on": self.detect_enabled,
+                       "ts": round(time.time(), 3)})
+        return True
+
+    def set_detect(self, enabled):
+        """页面开关的入口。**只能在 GLib 线程调用**（device_agent 用 run_on_glib）。"""
+        self._detect_requested = bool(enabled)
+        return self._apply_detect(enabled)
+
+    def detect_state(self):
+        """给 GET /detect 用。只读普通属性，任意线程可调。"""
+        det = self.detector
+        return {
+            "enabled": bool(self.detect_enabled),
+            "model": getattr(self.args, "detect_model", detect.MODEL_DEFAULT),
+            "fps": int(getattr(self.args, "detect_fps", 5)),
+            "frames": det.frames if det is not None else 0,
+            "errors": det.errors if det is not None else 0,
+            # 上游给的帧快过 fps 时被检测线程丢掉的数量（见 detect.too_soon）。
+            # 换源/开关之后它会涨一阵 —— 那是 videorate 在那段时间不丢帧。
+            "skipped": det.skipped if det is not None else 0,
+        }
+
+    def _on_detect_result(self, result):
+        """检测线程回调 → 投回 GLib 线程再发 DataChannel。
+
+        检测线程绝不能直接 emit DC 信号：DataChannel 属于 GLib 线程的对象，
+        跨线程碰它是未定义行为（和 teleop 的 _dc_send 同一个规则）。
+        """
+        if self.stopped:
+            return
+        GLib.idle_add(self._send_detect_result, result)
+
+    def _send_detect_result(self, result):
+        if self.stopped:
+            return GLib.SOURCE_REMOVE
+        if self._dc_send(result):
+            self.n_detect_sent += 1
+        else:
+            self.n_detect_dropped += 1
+        return GLib.SOURCE_REMOVE
+
     def _dc_state(self):
         if self.dc is None:
             return None
@@ -551,6 +735,10 @@ class DeviceSession:
     def _on_dc_open(self, channel):
         log.info("DataChannel 已打开（label=%s），可以接收遥操作命令",
                  channel.get_property("label"))
+        # 检测可能在通道打开之前就开着了（比如上一轮观看端留下的开关）。
+        # 补一条当前状态，页面不用等下一帧检测结果才知道按钮该是什么样。
+        self._dc_send({"t": "det", "on": bool(self.detect_enabled),
+                       "ts": round(time.time(), 3)})
 
     def _on_dc_close(self, _channel):
         log.warning("DataChannel 已关闭")

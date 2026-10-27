@@ -29,7 +29,7 @@
   button:hover:not(:disabled){ background:#39415380; }
   button:disabled{ opacity:.45; cursor:default; }
   button.on{ background:#1f4d33; border-color:var(--ok); color:var(--ok); }
-  #talkHint { color:var(--dim); font-size:12px; }
+  #talkHint, #detectHint { color:var(--dim); font-size:12px; }
   /* 摄像头分段按钮。用现成的 button + .on 激活态，不引 select —— 两个选项
      时按钮更直观，而且 .on 那套已经在「开始对讲」上用着了，样式是白拿的。 */
   .cams { display:flex; gap:6px; align-items:center; }
@@ -60,6 +60,17 @@
     width:100%; aspect-ratio:16/9; background:#000; display:block;
     border:1px solid var(--line); border-radius:8px;
   }
+  /* 检测框叠在 video 上面，是**页面画的**，不在视频流里。
+     好处：开关不影响编码参数，关掉之后一个框都不剩；代价：截图/录屏
+     拿到的是干净画面（这也正是我们要的）。
+     canvas 跟着 video 的边框盒走，四周各让开 1px —— 否则框会压在
+     video 的边框上，而且会和画面差 1px。 */
+  .video-wrap { position:relative; min-width:0; }
+  #detOverlay {
+    position:absolute; top:1px; left:1px;
+    width:calc(100% - 2px); height:calc(100% - 2px);
+    pointer-events:none; border-radius:8px;
+  }
   .side { display:flex; flex-direction:column; gap:8px; min-width:0; }
   pre {
     background:var(--panel); border:1px solid var(--line); border-radius:8px;
@@ -82,6 +93,10 @@
   <!-- 摄像头按钮由 loadCameras() 按板子给的清单生成（GET /camera）。
        清单为空时 .cams:empty 会整块隐藏，不留一个空标签。 -->
   <span class="cams" id="cams"></span>
+  <!-- 人像检测开关。检测在板子的 NPU 上跑，结果走遥操作那条
+       DataChannel 回页面，由页面画框 —— 视频流本身不带框。 -->
+  <button id="detectBtn" disabled>人像检测</button>
+  <span id="detectHint">检测…</span>
   <span id="status" class="status">未连接</span>
 </div>
 
@@ -102,7 +117,11 @@
        得有用户手势。没有它，页面一打开视频就被拒绝播放，表现是全黑 ——
        而原因和媒体链路毫无关系。点「开始对讲」时那个手势同时用来解除静音。
        （另一个坑：就是 muted 让阶段一的"听不见板子"看起来像 bug，其实不是。） -->
-  <video id="video" autoplay playsinline muted></video>
+  <div class="video-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <!-- 检测框画在这里，不动 video 本身（见 #detOverlay 的注释）。 -->
+    <canvas id="detOverlay"></canvas>
+  </div>
   <div class="side">
     <pre id="stats">等待发布端…</pre>
     <pre id="ice">连接后自动显示 ICE 详情。</pre>
@@ -117,6 +136,7 @@
 const $ = (id) => document.getElementById(id);
 const video = $("video"), logEl = $("log"), statsEl = $("stats");
 const statusEl = $("status"), iceEl = $("ice");
+const detCanvas = $("detOverlay");
 
 // 房间号：URL 上的 ?room= 优先，没给就问板子要（见 resolveRoom）。
 // **不能在这里写死默认值** —— 信令服务器只认它配置的那一个房间，页面写死的值
@@ -492,6 +512,7 @@ function teardownPc() {
   lastStats = null;
   statsEl.textContent = "等待发布端…";
   resetTeleop();
+  clearDetections(false);   // 画面都没了，框不能留在黑底上
 }
 
 /* 把板子 offer 里的 m-line 和方向打出来。
@@ -589,7 +610,7 @@ function attachTeleopChannel(ch) {
     log("遥操作 DataChannel 出错: " + err);
     renderTeleop();
   };
-  ch.onmessage = (ev) => handleTeleopReply(ev.data);
+  ch.onmessage = (ev) => handleChannelMessage(ev.data);
 
   log(`遥操作 DataChannel 已接到（label=${ch.label}，状态=${ch.readyState}）`);
   renderTeleop();
@@ -672,9 +693,24 @@ function sendTeleop(cmd, arg) {
   return true;
 }
 
-function handleTeleopReply(data) {
+/* 这条通道现在跑两种消息：遥操作的 ack/nack，和人像检测的 det。
+   **必须先分流再交给 handleTeleopReply** —— 那个函数把不认识的 t 记成
+   badReply，检测结果会被当成坏回执，页面日志几秒钟就刷满了。
+   只解析一次，遥操作那边拿现成的对象。 */
+function handleChannelMessage(data) {
   let msg;
   try { msg = JSON.parse(data); }
+  catch { handleTeleopReply(data); return; }   // 让它按原样报"不是 JSON"
+  if (msg && typeof msg === "object" && msg.t === "det") {
+    handleDetectMsg(msg);
+    return;
+  }
+  handleTeleopReply(msg);
+}
+
+function handleTeleopReply(data) {
+  let msg;
+  try { msg = (typeof data === "string") ? JSON.parse(data) : data; }
   catch {
     teleop.badReply++;
     log("遥操作：回执不是 JSON: " + String(data).slice(0, 80));
@@ -782,6 +818,213 @@ function resetTeleop() {
   teleop.nackReasons = {};
   renderTeleop();
 }
+
+/* ------------------------------------------------------------ 人像检测
+   检测在板子的 NPU 上跑（src/detect.py），结果走**遥操作那条 DataChannel**
+   回来：
+
+     {"t":"det","on":true,"ts":...,"ms":12.3,"n":1,
+      "boxes":[[x,y,w,h,score], ...]}
+
+   坐标是归一化的（0~1，相对画面左上角），所以页面不需要知道摄像头分辨率，
+   CSS 尺寸变了也不用重新对齐。板子按 fps 发；检测关着时一条都不发。
+
+   为什么画在 canvas 上而不是让视频带框：<video> 只是播放流，流里没有框。
+   要让流里带框得在板子上烧录（cairooverlay），那是另一种取舍 —— 现在选的
+   是页面叠加层：截图/录像是干净画面，开关也不碰编码参数。 */
+
+const detectState = {
+  available: false,     // 板子上模型 + rknnlite 就绪
+  enabled: false,       // 开着（以板子回的消息为准）
+  busy: false,          // 一次 POST 还没回来
+  boxes: [],
+  ms: null,
+  at: 0,                // 收到最后一帧结果时的 performance.now()
+  reason: "",           // 不可用的原因，挂在按钮 tooltip 上
+};
+
+// 5 fps 下 1.5 秒没消息就当作断了：宁可暂时没框，也不要让一个已经走开的
+// 人的框继续挂在画面上 —— 那比没有检测更误导。
+const DET_STALE_MS = 1500;
+
+/* GET /detect：模型在不在、现在开着没有。和摄像头清单一样轮询 ——
+   板子的状态未必是这个页面改的（tools/ 里的脚本会直接用 curl 发 POST）。 */
+async function loadDetect(quiet) {
+  try {
+    const r = await fetch("./detect", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    detectState.available = !!j.available;
+    detectState.reason = j.reason || "";
+    // busy 期间不采纳板子状态：否则点了"开"、POST 还没回来，2 秒一次的
+    // 轮询把旧的 false 盖上去，按钮会闪回关闭态。
+    if (!detectState.busy) detectState.enabled = !!j.enabled;
+    if (!detectState.enabled) clearDetections(false);
+    renderDetect();
+    if (!quiet) {
+      log(detectState.available
+          ? `人像检测可用（${j.model || "?"}，${j.fps || "?"} fps，`
+            + `阈值 ${j.conf ?? "?"}）`
+          : "人像检测不可用：" + (detectState.reason || "板子没说原因").split("\n")[0]);
+    }
+  } catch (e) {
+    if (!quiet) {
+      log("取检测状态失败（" + e.message + "）—— 板子上 device_agent.py 起了吗？");
+    }
+  }
+}
+
+async function toggleDetect() {
+  if (detectState.busy || !detectState.available) return;
+  const want = !detectState.enabled;
+  detectState.busy = true;
+  renderDetect();
+  // 开启要加载模型、初始化 NPU，几秒都正常。按钮先置灰，别让用户连点出
+  // 一串请求，也别让轮询在中间插一脚。
+  const t0 = performance.now();
+  try {
+    const r = await fetch("./detect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: want }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body.ok) {
+      log(`人像检测切换失败（HTTP ${r.status}）：`
+          + (body.error || "服务器没说原因"));
+      // 开不起来时板子会把实际状态带回来（比如模型加载失败 → false）。
+      if (typeof body.enabled === "boolean") detectState.enabled = body.enabled;
+    } else {
+      detectState.enabled = !!body.enabled;
+      log(`人像检测已${detectState.enabled ? "开启" : "关闭"}`
+          + `（板子侧用时 ${Math.round(performance.now() - t0)} ms）`
+          + (body.applied ? "" : "，还没有观看端建流，等接入时生效"));
+    }
+  } catch (e) {
+    log("人像检测切换请求失败: " + e.message);
+  } finally {
+    if (!detectState.enabled) clearDetections(false);
+    detectState.busy = false;
+    renderDetect();
+  }
+}
+
+function renderDetect() {
+  const btn = $("detectBtn"), hint = $("detectHint");
+  const { available, enabled, busy, boxes, ms } = detectState;
+  btn.disabled = !available || busy;
+  btn.classList.toggle("on", enabled);
+  btn.title = available
+    ? (enabled ? "点一下关掉（框只画在页面上，不在视频流里）"
+               : "在板子的 NPU 上跑人像检测")
+    : (detectState.reason || "板子上没有可用的检测模型");
+
+  if (!available) {
+    hint.textContent = "不可用";
+    hint.title = detectState.reason || "";
+  } else if (busy) {
+    hint.textContent = enabled ? "正在关闭…" : "正在启动…";
+    hint.title = "";
+  } else if (!enabled) {
+    hint.textContent = "已关闭";
+    hint.title = "";
+  } else if (!detectState.at) {
+    hint.textContent = "等待第一帧…";
+    hint.title = "";
+  } else if (performance.now() - detectState.at > DET_STALE_MS) {
+    hint.textContent = "没有新结果";
+    hint.title = "1.5 秒没收到检测结果，框已清掉";
+  } else {
+    hint.textContent = `${boxes.length} 人`
+      + (ms != null ? ` · ${ms.toFixed(1)} ms` : "");
+    hint.title = "ms 是 NPU 推理耗时，不含抓帧和传输";
+  }
+}
+
+/* 板子回来的检测消息。两种形状：
+     {"t":"det","on":false}                    开关状态变了
+     {"t":"det","on":true,...,"boxes":[...]}   一帧结果 */
+function handleDetectMsg(msg) {
+  if (typeof msg.on === "boolean") detectState.enabled = msg.on;
+  if (!msg.on) {
+    clearDetections(false);
+    renderDetect();
+    return;
+  }
+  if (Array.isArray(msg.boxes)) {
+    detectState.boxes = msg.boxes.filter((b) =>
+      Array.isArray(b) && b.length >= 4
+      && b.slice(0, 4).every((v) => typeof v === "number" && isFinite(v))
+      && b[2] > 0 && b[3] > 0);
+    detectState.ms = (typeof msg.ms === "number") ? msg.ms : null;
+    detectState.at = performance.now();
+    drawDetections();
+  }
+  renderDetect();
+}
+
+/* 把归一化坐标画到 canvas 上。每次画都先对一遍尺寸：video 是响应式的，
+   窗口一变 canvas 的位图尺寸不会自己跟 —— 不对尺寸的话框会被拉伸。 */
+function drawDetections() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = detCanvas.clientWidth, h = detCanvas.clientHeight;
+  if (!w || !h) return;                    // 还没布局，等下一帧
+  const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (detCanvas.width !== bw || detCanvas.height !== bh) {
+    detCanvas.width = bw;
+    detCanvas.height = bh;
+  }
+  const ctx = detCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const boxes = detectState.boxes;
+  if (!boxes.length) return;
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#3ddc84";
+  ctx.font = "600 12px ui-monospace,Consolas,monospace";
+  ctx.textBaseline = "top";
+  for (const [nx, ny, nw, nh, score] of boxes) {
+    const x = nx * w, y = ny * h, rw = nw * w, rh = nh * h;
+    ctx.strokeRect(x, y, rw, rh);
+    if (score == null) continue;
+    const label = `${Math.round(score * 100)}%`;
+    const tw = ctx.measureText(label).width;
+    // 框贴着画面顶端时标签改放框内，别画到画面外。
+    const ly = y >= 16 ? y - 16 : y;
+    ctx.fillStyle = "rgba(0,0,0,.55)";
+    ctx.fillRect(x, ly, tw + 8, 16);
+    ctx.fillStyle = "#3ddc84";
+    ctx.fillText(label, x + 4, ly + 2);
+  }
+}
+
+function clearDetections(logIt) {
+  const had = detectState.boxes.length > 0;
+  detectState.boxes = [];
+  detectState.ms = null;
+  detectState.at = 0;
+  drawDetections();                        // boxes 已空 → 只清屏
+  if (logIt && had) log("人像检测：清掉旧框");
+}
+
+window.addEventListener("resize", () => drawDetections());
+
+// 检测线程停了（拔线、线程挂了）板子不会发"结束"消息，只能靠超时。
+setInterval(() => {
+  if (!detectState.enabled) return;
+  if (detectState.at && performance.now() - detectState.at > DET_STALE_MS
+      && detectState.boxes.length) {
+    log("人像检测：1.5 秒没有新结果，清框");
+    const at = detectState.at;
+    clearDetections(false);
+    // 保留时间戳：状态该说"没有新结果"，而不是退回"等待第一帧" ——
+    // 后者看起来像马上要开始了。
+    detectState.at = at;
+  }
+  renderDetect();
+}, 500);
 
 /* ------------------------------------------------------------ 连接流程 */
 async function connect() {
@@ -1351,6 +1594,10 @@ $("cmdSend").addEventListener("click", submitCmdInput);
 $("cmdInput").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") { ev.preventDefault(); submitCmdInput(); }
 });
+$("detectBtn").addEventListener("click", () => {
+  toggleDetect().catch((e) => log("toggleDetect 抛异常: " + e.message));
+});
+renderDetect();
 for (const [cmd, arg] of QUICK_COMMANDS) {
   const b = document.createElement("button");
   b.textContent = arg === null ? cmd : `${cmd} ${arg}`;
@@ -1370,6 +1617,7 @@ if (!window.isSecureContext) {
 // 时会提前 return，把按钮的加载绑上去就等于"加了 ?room= 按钮就没了"。
 // 也不 await：清单晚一点到不影响看画面。
 loadCameras();
+loadDetect();
 connect();
 
 /* 之后每 2 秒再问一次，因为**当前是哪一路以板子为准**（见上面 currentCam 的
@@ -1379,6 +1627,11 @@ connect();
    轮询也顺手让 present 保持新鲜：摄像头拔了按钮就置灰。
    quiet=true：没变化时不往日志区刷，否则 2 秒一条会把它淹掉。 */
 setInterval(() => { loadCameras(true); }, 2000);
+
+/* 检测开关同样以板子为准（理由同上）。quiet：没变化不刷日志。
+   注意这和上面那个 500ms 的检测状态渲染不是一回事：那个只重画本地状态，
+   这个才去问板子。 */
+setInterval(() => { loadDetect(true); }, 2000);
 </script>
 </body>
 </html>

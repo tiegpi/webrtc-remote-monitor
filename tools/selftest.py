@@ -144,6 +144,7 @@ class TeleopClient:
         self.echo_bad = 0              # 回执里的 cmd/ts 和发出去的不一致
         self.wrong_verdict = 0         # 合法命令收到 NACK / BOGUS 收到 ACK
         self.bad_reply = 0             # 回执本身不是合法 JSON
+        self.det_msgs = 0              # 同一条通道上收到的人像检测消息
         self.nack_reasons = {}
         self.rtts = []
         self.pending = {}
@@ -243,6 +244,12 @@ class TeleopClient:
             return
 
         kind = msg.get("t")
+        # 人像检测的结果也走这条通道（阶段四）。它不是回执，不进 teleop 的账 ——
+        # 否则每条检测结果都会被记成"陌生回执"，判据直接变红。
+        if kind == "det":
+            self.det_msgs += 1
+            return
+
         seq = msg.get("seq")
         rec = self.pending.pop(seq, None) if isinstance(seq, int) else None
         if rec is None:
@@ -845,6 +852,9 @@ def teleop_report(t, args, dev):
                      "SCTP/DTLS 没通，命令一条都发不出去" % t.label)
         return fails
     log.info("OK  C 路通：板子建的 DataChannel 打开成功")
+    if t.det_msgs:
+        log.info("    同一条通道上还收到 %d 条检测结果（不参与遥操作判据）",
+                 t.det_msgs)
 
     if t.message_signal is None:
         fails.append("DataChannel 上没有可用的消息信号，收不到回执")

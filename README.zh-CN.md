@@ -40,6 +40,7 @@ DTLS/SRTP + ICE，局域网直连，跨网时由 coturn 中继兜底。同一份
 | **运行期切换摄像头** | 从页面点按钮即可换采集段。**不重新协商、不重建 PeerConnection**，音频不断；实测最长停顿 367 ms（一个 GOP） |
 | **双向语音** | 板子麦克风 → 浏览器；浏览器麦克风 → 板子 3.5 mm 输出。两个方向分别计数 |
 | **遥操作** | 白名单命令走 DataChannel，每条都有 ACK/NACK；命令同时被写进**视频画面左上角**，文字只能由板子产生 |
+| **人像检测（NPU）** | RK3588 NPU 上跑 YOLOv5s（5 fps），框和人数画在**页面叠加层**上，视频流本身保持干净。模型缺失只让按钮置灰，不影响视频 |
 | **局域网 / 公网两种部署** | 同一个 `signal_server.py`：板子上跑就是局域网模式，VPS 上跑配 coturn 就是公网模式 |
 | **可验证** | 13 / 17 / 22 条验收判据、切换专项 13 条、设备 fd 回收检查、无头对端自测 |
 
@@ -114,6 +115,27 @@ Orange Pi 5 上没有 Rockchip 的 `rkaiq_3A_server`，AE/AWB 都在那个用户
 | `sent == acked + nacked` | 丢了一条命令，被当成"页面没发" |
 | 板端 `teleop_overlay` 跟得上 ACK | ACK 是真的，但视频那道环已经死了 |
 | 板端 `teleop_rx` 和页面 `sent` 对得上 | 页面自己发、自己记账、自己判自己过 |
+| 检测开启后 `frames` 涨、关闭后停 | 把"POST 成功了"当成"NPU 真的在跑/真的停了" |
+
+### 4. 人像检测：NPU 旁路 + 页面画框
+
+检测在 RK3588 的 NPU 上跑（`rknn-toolkit-lite2` + YOLOv5s 的 `.rknn`），从
+`textoverlay` 之后的 `tee` 分出一条支路，经 `valve`、`videorate`、`videoscale`
+到 640×360 的 appsink。**valve 默认关**：没开检测时这条支路一个 buffer 都不走，
+空闲成本约等于零；队列是 `leaky`，NPU 慢时丢旧帧，绝不反压编码主路。
+
+结果走**已有的遥操作 DataChannel**回页面（`{"t":"det",...}`，归一化坐标），
+页面把框画在 `<video>` 上面的 canvas 里。三个刻意的取舍：
+
+- **框不烧进视频流**：截图/录像是干净画面，开关检测也不碰编码参数。烧录
+  （`cairooverlay`）是另一条路，改的是采集段而不是页面。
+- **不用 OpenCV**：板子上 `cv2` 和 numpy 2.x 不兼容，所以 letterbox、anchor
+  解码、NMS、归一化全部用 numpy 自己写，并在宿主机上用合成张量单测
+  （`tools/check_detect.py`）—— 这三段错了都不会报错，只会让框整体偏移或叠几层。
+- **归一化坐标**（0~1）：页面不需要知道摄像头分辨率，CSS 尺寸变了也不用重新对齐。
+
+生命周期沿用项目的 fd 约束：检测线程在旧采集段拆掉**之前**停；NPU 上下文在
+pipeline dispose 之前释放；换摄像头后重新绑到新段的 appsink 上。
 
 ## 实测数据
 
@@ -142,6 +164,10 @@ sudo apt install python3-gi python3-aiohttp python3-numpy \
 ```
 
 `numpy` 只有 `--camera-wb` 需要。可 pip 管理的部分见 [requirements.txt](requirements.txt)。
+
+人像检测另外需要 `rknn-toolkit-lite2`（板子厂商镜像通常自带）和一个 YOLOv5s
+`.rknn` 模型，两者都是**可选**的：没有时页面上的按钮置灰，视频完全不受影响。
+模型文件不入库，见「已知限制」。
 
 ### 局域网（不需要 VPS）
 
@@ -285,6 +311,10 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDI
 | `SIGNAL_HOST` | VPS 公网 IP / 域名 | 你的 VPS |
 | `SIGNAL_AUTH` | `user:pass`，板子访问 VPS 的 `/ice.json`、`/diag`、`/ws/view` 用 | `deploy_web_vps.sh` 打印 |
 
+可选项（不填就用默认值）：`CAMERA_SOURCE=usb` 让 agent 启动时直接选 USB 摄像头
+（默认 mipi，板载排线坏了的时候每次重启都得在页面上再点一次）；`DETECT*` 见
+`.env.example` 的注释。
+
 #### 4. 启动 / 停止（板子）
 
 ```bash
@@ -348,6 +378,9 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && tools/service.sh restart'
 | `--camera-ctl analogue_gain=176,exposure=1648` | 直接写 sensor 控件，不做闭环 |
 | `--ice-policy relay` | 强制走 TURN，用来证明中继真的生效 |
 | `--no-audio` | 只推视频，适合没有可用麦克风的板子 |
+| `--detect` | 启动时就开启检测（默认关，由页面开关） |
+| `--detect-model PATH` | YOLOv5s `.rknn` 文件；默认指向厂商镜像里的路径 |
+| `--detect-fps 5` / `--detect-conf 0.35` | 检测支路帧率与置信度阈值 |
 
 ## 怎么验证
 
@@ -362,8 +395,14 @@ bash tools/check_switch.sh --base https://<板子>:8443
 # 会话拆除后设备 fd 有没有还回去（在板子上跑）
 bash tools/check_fd.sh --cycles 3
 
+# 人像检测：可用性 → 开启后帧数在涨 → 关闭后帧数停住
+bash tools/check_detect.sh --base https://<板子>:8443
+
 # 遥操作协议单测（宿主机，不需要 GStreamer）
 python3 tools/check_teleop.py
+
+# 检测后处理单测（宿主机；板子上加 --model 跑一次真实推理）
+python3 tools/check_detect.py
 
 # 信令回归：busy 拒绝、viewer 路由与会话隔离、生命周期线程投递（不需要硬件）
 python3 tools/test_signal_server.py
@@ -406,6 +445,7 @@ src/
   signal_server.py   信令 + /ice.json + 诊断样本（局域网 / VPS 同一份）
   web_server.py      页面服务 + 同源代理（/ws/view、/ice.json、/diag、/camera）
   teleop.py          命令协议：白名单、校验、ACK/NACK、画面文案
+  detect.py          人像检测：RKNN 推理线程 + 纯 numpy 后处理（无 cv2）
   sdpview.py         SDP → 人话（工具共用）
 web/
   monitor.html       整个观看页：单文件、无构建步骤
@@ -417,6 +457,8 @@ tools/
   deploy_web_vps.sh  VPS：观看页服务 + nginx 路由
   gen_cert.sh        板子自签证书
   analyze_diag.py    主验收判据
+  check_detect.py    检测后处理单测（宿主机）+ 可选真实推理
+  check_detect.sh    /detect 开关判据：开时帧数涨、关时停
   check_* / selftest.py / turn_check.py …  专项排查工具
 docs/architecture.md 深潜水：拓扑、线程模型、静默失败记录
 ```
@@ -430,6 +472,10 @@ docs/architecture.md 深潜水：拓扑、线程模型、静默失败记录
 - **管线骨架不会立刻回收**。设备 fd 已经不漏（有 `check_fd.sh` 判据），但跨 C/Python
   的闭包环让骨架在会话之间继续活着（每轮几百 KB）。见架构文档第十一节。
 - **MIPI 画质受 sensor 限制**。暗房间里闭环也只能到 Y≈78，真正解决只能加光或换 sensor。
+- **检测模型不入库**。YOLOv5 的代码和权重是 AGPL-3.0，转换出的 `.rknn` 又和工具链/
+  板子版本绑定；本仓库的 MIT 只覆盖代码。用 `--detect-model` 指向自己的文件。
+- **检测框只在页面上**。不跑页面的客户端（裸 RTP、板端录像）看到的是干净画面；
+  要烧进流里得改采集段。
 
 ## 许可
 

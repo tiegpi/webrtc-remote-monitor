@@ -291,15 +291,15 @@ async def handle_ws_view(request):
 # --------------------------------------------------------------------------- #
 # 摄像头控制：同源转给 device_agent 的 unix socket
 # --------------------------------------------------------------------------- #
-async def handle_camera(request):
-    """把 /camera 转给 device_agent 的本地控制端点。
+async def _proxy_to_agent(request, endpoint):
+    """把请求原样转给 device_agent 的本地控制端点。
 
     **为什么让板子中转、而不让页面直连 device_agent**：页面是 https 来的，
     直连会同时踩上这个文件开头总结的那两个坑 —— 跨源，以及自签证书在
     fetch() 里静默 reject（没有任何交互能让你"继续前往"）。绕一手之后，
     浏览器这一侧只剩 web_server 一个来源，和信令那边是同一个思路。
 
-    走 unix socket 对页面完全透明：它只看到同源的 POST /camera。
+    走 unix socket 对页面完全透明：它只看到同源的 /camera、/detect。
     """
     args = request.app["args"]
     sock = agent_socket_path(args)
@@ -313,7 +313,7 @@ async def handle_camera(request):
             connector=aiohttp.UnixConnector(str(sock))
         ) as local:
             async with local.request(
-                request.method, "http://localhost/camera",
+                request.method, "http://localhost/%s" % endpoint,
                 data=body or None, headers=headers,
             ) as r:
                 payload = await r.read()
@@ -325,9 +325,19 @@ async def handle_camera(request):
     except (aiohttp.ClientError, OSError) as exc:
         # device_agent 没跑（或者 socket 被删了）时给明确的 502。
         # 页面那边会把这句打到日志区 —— 比一个空 200 好得多。
-        log.warning("转发 /camera 失败（%s）: %s", sock, exc)
+        log.warning("转发 /%s 失败（%s）: %s", endpoint, sock, exc)
         raise web.HTTPBadGateway(
             text="连不上推送端（%s）。device_agent.py 起了吗？" % sock)
+
+
+async def handle_camera(request):
+    """GET/POST /camera → device_agent（有哪些摄像头 / 切换）。"""
+    return await _proxy_to_agent(request, "camera")
+
+
+async def handle_detect(request):
+    """GET/POST /detect → device_agent（检测是否可用 / 开关）。"""
+    return await _proxy_to_agent(request, "detect")
 
 
 # --------------------------------------------------------------------------- #
@@ -357,6 +367,7 @@ def build_app(args):
     # 必须在最后那条 /{path:.*} 兜底路由**之前**注册，否则会被它当静态文件吃掉。
     app.router.add_get("/config.json", handle_config)
     app.router.add_route("*", "/camera", handle_camera)
+    app.router.add_route("*", "/detect", handle_detect)
     app.router.add_route("*", "/ws/view", handle_ws_view)
     for p in PROXY_PATHS:
         app.router.add_route("*", p, handle_proxy)

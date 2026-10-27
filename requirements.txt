@@ -14,5 +14,11 @@
 aiohttp>=3.8,<4
 
 # Only required for --camera-wb (gray-world white balance when the board has
-# no AWB). Verified with both 1.21 and 2.x.
+# no AWB) and for person detection (numpy-only post-processing). Verified with
+# both 1.21 and 2.x.
 numpy>=1.21
+
+# Person detection also needs rknn-toolkit-lite2 (the RKNN runtime). It is not a
+# normal pip package on arm64: install the board vendor's matching build of
+# rknn-toolkit-lite2 + librknnrt. Without it, detection is unavailable and the
+# page disables the button; video is unaffected.
