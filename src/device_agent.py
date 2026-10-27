@@ -846,6 +846,17 @@ def main(argv=None):
             log.error("ROS 模式用不了：%s", problem)
             return 2
 
+    # 信任锚先看一眼。缺文件时 ssl.create_default_context 抛的是
+    # `[Errno 2] No such file or directory`，会被重连循环吞成一行"与信令服务器
+    # 断开"，看起来像网络问题，实际上是 .env 指了张不存在的证书（或换了台
+    # 机器没把 certs/ 拷过来）。
+    if (args.signal or "").startswith("wss://") and args.tls_ca \
+            and not Path(args.tls_ca).is_file():
+        log.error("找不到信任锚 %s —— 那是连 VPS 用的自签证书。"
+                  "从别的部署拷一份 certs/ 过来，或重跑 tools/gen_cert.sh",
+                  args.tls_ca)
+        return 2
+
     # 音频设备在**启动时**定下来，不是每次建 pipeline 时：公网模式下每来一个
     # 观看端就会建一条 pipeline，拖到那时候才发现"没麦克风"会按观看者数重复报错，
     # 而且报在观看端接入之后，看起来像是接入流程坏了。
