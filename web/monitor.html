@@ -37,6 +37,13 @@
     content:"摄像头"; color:var(--dim); font-size:12px; margin-right:2px;
   }
   .cams:empty { display:none; }
+  /* 运行模式徽标。monitor = 阶段一/二/三（语音 + 遥操作）；detect = 轻量直连，
+     框已经烧进画面，页面不再需要命令台。 */
+  .mode {
+    color:var(--dim); font-size:12px; border:1px solid var(--line);
+    border-radius:999px; padding:2px 8px;
+  }
+  .mode.detect { color:var(--ok); border-color:var(--ok); }
   /* 遥操作条。样式刻意和上面那条 bar 一样 —— 它是同一条控制带，
      不是另一块面板。可用的按钮在通道打开前置灰：点一个"发了但没出去"
      的按钮，比按钮灰着更让人误解。 */
@@ -77,6 +84,7 @@
 
 <div class="bar">
   <span id="roomLabel">房间 —</span>
+  <span id="modeLabel" class="mode">模式 …</span>
   <button id="talkBtn">开始对讲</button>
   <span id="talkHint">点了之后浏览器才会申请麦克风</span>
   <!-- 摄像头按钮由 loadCameras() 按板子给的清单生成（GET /camera）。
@@ -85,10 +93,11 @@
   <span id="status" class="status">未连接</span>
 </div>
 
-<div class="bar teleop">
+<div class="bar teleop" id="teleopBar">
   <!-- 命令台。命令是**模拟执行**的：板子收到的唯一动作就是把命令写进画面，
        所以"这条命令到底有没有到板子"只能靠 ACK 和画面里的那行字来证。
-       输入框和快捷按钮走同一个 sendTeleop()，不各写一套。 -->
+       输入框和快捷按钮走同一个 sendTeleop()，不各写一套。
+       detect 模式没有 DataChannel，这一条由 applyMode() 整块藏起来。 -->
   <input id="cmdInput" type="text" placeholder="FORWARD 12 / STOP / SPEED 50"
          autocomplete="off" spellcheck="false">
   <button id="cmdSend">发送</button>
@@ -134,7 +143,7 @@ let iceServers = [];          // 从 /ice.json 拿到的 STUN/TURN 配置
 // 样本里新字段是空的 —— 分不清是"用户没刷"、"浏览器吃了缓存"还是"我字段名
 // 写错了"。有了版本号，样本自己就说得出跑的是哪版 JS，不用再靠 md5 猜。
 // 每次改这个文件都要动这里。
-const PAGE_VERSION = "2026-10-18.1";
+const PAGE_VERSION = "2026-10-27.1";
 
 let lastStats = null;         // 最近一次完整样本，供 diag 上报
 const pendingCandidates = []; // setRemoteDescription 之前到达的候选先缓存
@@ -146,6 +155,9 @@ const pendingCandidates = []; // setRemoteDescription 之前到达的候选先�
 let cams = [];                // 板子给的清单，含 present
 let currentCam = null;        // 当前这一路（板子说了算，不是页面自己记的）
 let camBusy = false;          // 串行化，防连点
+// 板子的运行模式（GET /camera 里的 mode）。monitor = 语音 + 遥操作命令台；
+// detect = 框已经烧进 H.264 画面，没有 DataChannel，命令台不显示。
+let pageMode = null;
 
 // 浏览器的麦克风。**必须在 setRemoteDescription 之前**加进 pc —— 见 startTalk
 // 和 createPc 里的说明，这是阶段二最容易踩的一个顺序问题。
@@ -223,6 +235,7 @@ async function loadCameras(quiet) {
     const prev = currentCam;
     cams = j.available || [];
     currentCam = j.current || null;
+    applyMode(j.mode);
     renderCams();
     // 变了才记账。prev 为 null 是首次加载（页面还不知道原来是谁），不算切换。
     if (prev !== null && currentCam !== prev) noteSourceChanged();
@@ -235,6 +248,25 @@ async function loadCameras(quiet) {
       log("取摄像头列表失败（" + e.message + "）—— 不显示切换按钮。"
           + "板子上 device_agent.py 起了吗？");
     }
+  }
+}
+
+/* 板子的模式只影响**页面布局**，不影响 PeerConnection：视频、音频、ICE
+   都是同一条链路。detect 模式的框已经在 H.264 帧里，页面这边没有任何
+   canvas 叠加层要维护。 */
+function applyMode(mode) {
+  const m = mode === "detect" ? "detect" : "monitor";
+  if (m === pageMode) return;
+  pageMode = m;
+  const badge = $("modeLabel");
+  badge.textContent = m === "detect" ? "模式 detect · 检测框已烧进画面"
+                                     : "模式 monitor";
+  badge.className = "mode" + (m === "detect" ? " detect" : "");
+  // detect 模式不建 DataChannel，命令台整块藏起来。这里用 display 而不是
+  // 删 DOM：切回 monitor（换板子/重启）时页面不用重建。
+  $("teleopBar").style.display = m === "detect" ? "none" : "";
+  if (m === "detect") {
+    log("detect 模式：框由板子烧进视频流；这是纯监视，没有遥操作命令台");
   }
 }
 

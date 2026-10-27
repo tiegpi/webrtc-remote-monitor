@@ -37,6 +37,7 @@ from gi.repository import GLib
 
 import audio             # 音频设备探测：判错设备不会报错，只会推一路本底噪声
 import camera            # 画质兜底：板子没有 3A，亮度只能自己闭环
+import detect_mode       # detect 模式：OpenCV + RKNN + 画框（重依赖全在内部惰性 import）
 import pipeline          # 必须早于 Gst.init()：它会在导入时清掉 BSP 埋的环境变量
 import sources           # 板子上有哪些摄像头、各自要什么
 import whitebalance      # 画质兜底：同一根因的另一半 —— ISP 没跑 AWB，画面偏绿
@@ -209,6 +210,9 @@ async def handle_camera(request):
         return web.json_response({
             "available": sources.available(),
             "current": state.current_name(),
+            # 页面靠它决定显示 monitor 还是 detect：detect 模式的框已经烧进
+            # 画面，命令台没有意义，页面要把它藏起来。
+            "mode": getattr(state.args, "mode", "monitor"),
         })
 
     try:
@@ -272,11 +276,35 @@ async def handle_camera(request):
         return web.json_response({"ok": True, "current": applied, "applied": True})
 
 
+async def handle_stats(request):
+    """GET /stats = 板子侧当前的会话计数（和 1Hz 遥测同一份）。
+
+    没有观看端时返回 session=null，而不是一个空对象 —— 那能一眼区分"没人在看"
+    和"会话在跑但计数是 0"。detect 模式的 detect_* 字段只有那边才有。
+    """
+    state = request.app["state"]
+    session = state.session
+    if session is None or session.stopped:
+        return web.json_response({
+            "ok": True,
+            "mode": getattr(state.args, "mode", "monitor"),
+            "source": state.current_name(),
+            "session": None,
+        })
+    return web.json_response({
+        "ok": True,
+        "mode": getattr(state.args, "mode", "monitor"),
+        "source": state.current_name(),
+        "session": session.counters(),
+    })
+
+
 async def start_control(state):
     """起本地控制端点。返回 AppRunner，由调用方在退出时 cleanup。"""
     app = web.Application()
     app["state"] = state
     app.router.add_route("*", "/camera", handle_camera)
+    app.router.add_get("/stats", handle_stats)
 
     path = socket_path(state.args)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +318,7 @@ async def start_control(state):
     await web.UnixSite(runner, str(path)).start()
     # 只有本机、而且只有跑 web_server 的那个用户可以调它。
     os.chmod(path, 0o600)
-    log.info("控制端点 %s（GET/POST /camera）", path)
+    log.info("控制端点 %s（GET/POST /camera，GET /stats）", path)
     return runner
 
 
@@ -547,6 +575,18 @@ async def run_publisher(args, state):
     log.info("视频源 %s（%s）  %dx%d@%d  %s  %d kbps",
              src.name, src.device, args.width, args.height, args.fps,
              src.fourcc, args.bitrate // 1000)
+    if args.mode == "detect":
+        log.info("模式 detect（轻量直连）：OpenCV 预处理 + RKNN 推理，"
+                 "框烧进 H.264 画面，不依赖机器人框架")
+        log.info("  模型 %s", args.detect_model)
+        log.info("  推理上限 %g fps，conf %.2f，NMS IoU %.2f；"
+                 "视频仍是 %d fps（中间帧复用上一次的框）",
+                 args.detect_fps, args.detect_conf, args.detect_iou, args.fps)
+        if src.kind != "raw":
+            log.info("  源 %s 自带 AWB，--camera-wb 对 detect 模式跳过（只对 MIPI 生效）",
+                     src.name)
+    else:
+        log.info("模式 monitor：采集后直接硬件编码（语音 + 遥操作命令台可用）")
     log.info("  可切换的源：%s（页面上有按钮，走板子本地的控制通道）",
              "、".join("%s=%s" % (s.name, s.device) for s in sources.SOURCES))
     if args.no_audio:
@@ -621,6 +661,23 @@ def parse_args(argv=None):
     g.add_argument("--turn", default="", help="直接指定 TURN，覆盖服务器下发的")
     g.add_argument("--ice-policy", default="all", choices=["all", "relay"],
                    help="relay = 强制走 TURN。用来验证中继真的生效")
+
+    m = p.add_argument_group("运行模式（同一条 WebRTC 链路，视频前端不同）")
+    m.add_argument("--mode", choices=["monitor", "detect"], default="monitor",
+                   help="monitor = 采集后直接硬件编码（推流 + 语音 + 遥操作）；"
+                        "detect = 采集后 OpenCV 预处理 + RKNN 推理，框烧进画面，"
+                        "再硬件编码（轻量直连，适合简单远程监控，不依赖机器人框架）")
+    m.add_argument("--detect-model", default=detect_mode.MODEL_DEFAULT,
+                   help="detect 模式的 .rknn 模型路径。模型不入库，"
+                        "来源见 README 的「detect 模式」一节")
+    m.add_argument("--detect-fps", type=float,
+                   default=detect_mode.DETECT_FPS_DEFAULT,
+                   help="detect 模式的**推理**频率。视频帧率仍由 --fps 决定："
+                        "两者之间复用上一次的框，画面不降帧")
+    m.add_argument("--detect-conf", type=float, default=detect_mode.CONF_DEFAULT,
+                   help="person 的置信度阈值")
+    m.add_argument("--detect-iou", type=float, default=detect_mode.IOU_DEFAULT,
+                   help="NMS 的 IoU 阈值")
 
     c = p.add_argument_group(
         "摄像头（两个源都能用，观看页上可以随时切，见 src/sources.py）。"
@@ -699,6 +756,11 @@ def main(argv=None):
 
     # 白平衡的参数和依赖在建 pipeline 之前先验掉：公网模式下每来一个观看端就会
     # 建一条 pipeline，拖到那时候才发现"板子上没装 numpy"会按观看者数重复报错。
+    #
+    # detect 模式的依赖是另一套（numpy + cv2 + rknnlite），而且**不能**走
+    # whitebalance.check_available()：它会 import 用户目录里的 numpy 2.x，
+    # 把系统给 python3-opencv 编的 1.x 挤掉。启动时只做参数检查和
+    # detect_mode.check_available()，真正加载模型在桥线程里（有观看端之后）。
     if args.camera_wb:
         try:
             whitebalance.parse_spec(args.camera_wb)
@@ -708,10 +770,30 @@ def main(argv=None):
                       "       --camera-wb 1.71,1.55    手动给 R、B 的增益（G 固定为 1）",
                       whitebalance.WB_CALIB_FRAMES)
             return 2
-        problem = whitebalance.check_available()
-        if problem:
-            log.error("--camera-wb 用不了：%s", problem)
+
+    if args.mode == "detect":
+        if not (0.0 < args.detect_fps <= 60.0):
+            log.error("--detect-fps 要在 (0, 60] 之间，收到 %s", args.detect_fps)
             return 2
+        if not (0.0 < args.detect_conf < 1.0):
+            log.error("--detect-conf 要在 (0, 1) 之间，收到 %s", args.detect_conf)
+            return 2
+        if not (0.0 < args.detect_iou <= 1.0):
+            log.error("--detect-iou 要在 (0, 1] 之间，收到 %s", args.detect_iou)
+            return 2
+        problem = detect_mode.check_available(args.detect_model)
+        if problem:
+            log.error("detect 模式用不了：%s", problem)
+            if "numpy 版本冲突" in problem:
+                log.error("  tools/run-agent.sh 在 detect 模式下已经用 python3 -s；"
+                          "手动启动时也要带上它")
+            return 2
+    else:
+        if args.camera_wb:
+            problem = whitebalance.check_available()
+            if problem:
+                log.error("--camera-wb 用不了：%s", problem)
+                return 2
 
     # 音频设备在**启动时**定下来，不是每次建 pipeline 时：公网模式下每来一个
     # 观看端就会建一条 pipeline，拖到那时候才发现"没麦克风"会按观看者数重复报错，

@@ -5,7 +5,9 @@ DataChannel 命令台，全部走标准 WebRTC，不装插件、不依赖厂商 
 
 推流端（`device_agent.py`）**主动连出去**，一个入站 TCP 端口都不开；媒体走
 DTLS/SRTP + ICE，局域网直连，跨网时由 coturn 中继兜底。同一份代码既能跑
-"局域网最小形态"，也能跑当前的公网部署。
+"局域网最小形态"，也能跑当前的公网部署。另有 `--mode detect` 的轻量直连形态：
+采集后直接 OpenCV + RKNN 推理，把检测框烧进画面再推流，见
+[轻量直连](#轻量直连detect-模式)。
 
 > 英文概览见 [README.md](README.md)；设计细节、线程模型和全部踩坑记录见
 > [docs/architecture.md](docs/architecture.md)。这份文件是中文使用说明。
@@ -40,6 +42,7 @@ DTLS/SRTP + ICE，局域网直连，跨网时由 coturn 中继兜底。同一份
 | **运行期切换摄像头** | 从页面点按钮即可换采集段。**不重新协商、不重建 PeerConnection**，音频不断；实测最长停顿 367 ms（一个 GOP） |
 | **双向语音** | 板子麦克风 → 浏览器；浏览器麦克风 → 板子 3.5 mm 输出。两个方向分别计数 |
 | **遥操作** | 白名单命令走 DataChannel，每条都有 ACK/NACK；命令同时被写进**视频画面左上角**，文字只能由板子产生 |
+| **轻量直连（`--mode detect`）** | 采集后 OpenCV 预处理 + RKNN（YOLOv5s）推理，人框**烧进** H.264 画面再推流。适合简单远程监控，不需要机器人框架；切换摄像头、ICE、语音仍走同一套 |
 | **局域网 / 公网两种部署** | 同一个 `signal_server.py`：板子上跑就是局域网模式，VPS 上跑配 coturn 就是公网模式 |
 | **可验证** | 13 / 17 / 22 条验收判据、切换专项 13 条、设备 fd 回收检查、无头对端自测 |
 
@@ -167,6 +170,51 @@ python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080
 
 > 只启动 `signal_server.py` 也能看画面（它自己会在 `/` 提供页面），但没有
 > `web_server.py` 的 `/camera` 代理，页面上不会出现切换摄像头的按钮。
+
+### 轻量直连（detect 模式）
+
+`--mode detect` 把"采集 → OpenCV 预处理 → RKNN 推理 → 烧框 → 硬件编码 → WebRTC"
+放在一个进程里，不引入机器人框架：
+
+```
+v4l2src ! caps ! [mppjpegdec] ! videoconvert ! BGR ! appsink
+                                     │
+                        DetectBridge 线程（OpenCV + RKNN）
+                                     │
+appsrc ! videoconvert ! mpph264enc ! h264parse ! rtph264pay ! webrtcbin
+```
+
+骨架（webrtcbin、音频、ICE、RTP）和 monitor 模式**完全同源**，换摄像头仍然只换
+采集段。区别只有三处：画面里多出烧好的框、没有遥操作 DataChannel、页面上不显示
+命令台。音频和切换摄像头都保留。
+
+额外依赖只有板子侧：
+
+```bash
+sudo apt install python3-opencv          # 板子上实测 4.5.4
+# rknn-toolkit-lite2 由板子厂商镜像提供（模型默认路径见 src/detect_mode.py）
+```
+
+启动（模型默认 `/userdata/rknn_yolov5_demo/model/RK3588/yolov5s-640-640.rknn`）：
+
+```bash
+MODE=detect tools/run-agent.sh
+
+# 常驻（service.sh）时环境变量会传进登录 shell；也可以把 MODE=detect
+# 写进 .env，之后 tools/service.sh restart agent 就一直是 detect：
+MODE=detect tools/service.sh restart agent
+
+# 也可以直接给参数：
+#   python3 -s src/device_agent.py ... --mode detect --detect-fps 5
+```
+
+`tools/run-agent.sh` 在 detect 模式下自动用 `python3 -s`：板子系统 numpy 是 1.21.5，
+用户目录里若装着 2.x，会盖住系统版本，`import cv2` 直接抛 ABI 错误。`-s` 不加载
+用户目录，两个版本就对上了（`PYTHONNOUSERSITE=1` 等价）。
+
+模型只做 **person** 类（YOLOv5s 的 80 类里取 0 号）。推理按 `--detect-fps`（默认 5）
+跑，中间帧复用上一帧的框、照常推流，所以视频仍是摄像头帧率。白平衡在 BGR 帧上做，
+只对 MIPI 生效；USB 自带 AWB 会跳过。
 
 ### 公网部署（当前形态）
 
@@ -348,6 +396,11 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && tools/service.sh restart'
 | `--camera-ctl analogue_gain=176,exposure=1648` | 直接写 sensor 控件，不做闭环 |
 | `--ice-policy relay` | 强制走 TURN，用来证明中继真的生效 |
 | `--no-audio` | 只推视频，适合没有可用麦克风的板子 |
+| `--mode detect` | 轻量直连：OpenCV + RKNN 推理，框烧进画面；不建遥操作通道 |
+| `--detect-model <path>` | detect 模式用的 `.rknn` 模型（默认见 `src/detect_mode.py`） |
+| `--detect-fps 5` | 推理频率，和视频帧率解耦；中间帧复用上一帧的框 |
+| `--detect-conf 0.35` / `--detect-iou 0.45` | 置信度门槛 / NMS 的 IoU 门槛 |
+| `--camera-source usb` | 启动时用哪一路摄像头；运行期仍可在页面上切 |
 
 ## 怎么验证
 
@@ -370,6 +423,15 @@ python3 tools/test_signal_server.py
 
 # 无头对端：真实 offer/answer、音频和 DataChannel，不需要浏览器
 python3 tools/selftest.py --signal https://<VPS> --room <房间> --duration 20
+
+# detect 模式：纯函数/模型单测（宿主机即可；带 --model 时在板子上跑真推理）
+python3 tools/check_detect_mode.py
+python3 -s tools/check_detect_mode.py --model /path/to/yolov5s.rknn --image bus.jpg
+
+# detect 模式端到端：agent 以 detect 模式推流、观看端已连上时，
+# 看 /stats 里的帧数/推理次数/人框数是否在涨；--switch-to 再验一次切换
+bash tools/check_detect_mode.sh --base https://<板子>:8443
+bash tools/check_detect_mode.sh --expect-boxes --switch-to usb
 ```
 
 诊断数据是**收集**而不是断言：页面 1 Hz 上报 `getStats()` 摘要（含一张 32×18 的亮度

@@ -16,3 +16,15 @@ aiohttp>=3.8,<4
 # Only required for --camera-wb (gray-world white balance when the board has
 # no AWB). Verified with both 1.21 and 2.x.
 numpy>=1.21
+
+# --mode detect additionally needs OpenCV and the RKNN Lite runtime. Neither is
+# pip-installable in a way that matches the board image:
+#
+#   OpenCV   -> sudo apt install python3-opencv     (板子上是 4.5.4)
+#   RKNN Lite-> Rockchip 的 rknn-toolkit-lite2      (板子厂商镜像通常自带)
+#
+# **numpy 必须和 python3-opencv 的 ABI 对齐。** 板子系统 numpy 是 1.21.5，
+# 用户目录里可能装着一个 2.x；默认启动会加载 2.x，导致 `import cv2` 直接
+# 抛 "compiled using NumPy 1.x cannot be run in NumPy 2.x"。所以 detect 模式
+# 要用 `python3 -s`（tools/run-agent.sh 已经这么做了），不要用 pip 升级
+# 系统 numpy，也不要在用户目录里装 numpy 2.x。

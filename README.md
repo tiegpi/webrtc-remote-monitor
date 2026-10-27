@@ -50,6 +50,10 @@ an explicit "device busy" status instead of kicking the first viewer off.
   and the command is rendered into the video stream itself (`CMD #7 FORWARD 10 ...`
   in the top-left corner). The text can only come from the board, so it proves both
   the control path and the media path in one glance.
+- **Lightweight direct mode (`--mode detect`)** — capture, OpenCV preprocessing, RKNN
+  (YOLOv5s) inference, and box burn-in, then the same hardware H.264 → WebRTC path.
+  For simple remote monitoring; no robot framework. Camera switching, ICE and voice
+  still use the shared skeleton.
 - **LAN and public deployment from the same code** — a single `signal_server.py` runs
   on the board for LAN-only mode or on a VPS with coturn for WAN access.
 
@@ -182,6 +186,54 @@ python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080
 Open `https://<board-ip>:8443/`. The page asks `/config.json` for the room number, so
 `?room=` is optional. Accept the self-signed certificate once; that also unlocks
 `getUserMedia` for two-way voice.
+
+### Detect mode (lightweight direct)
+
+`--mode detect` puts capture → OpenCV preprocessing → RKNN inference → box burn-in →
+hardware encode → WebRTC in one process, with no robot framework:
+
+```
+v4l2src ! caps ! [mppjpegdec] ! videoconvert ! BGR ! appsink
+                                     │
+                        DetectBridge thread (OpenCV + RKNN)
+                                     │
+appsrc ! videoconvert ! mpph264enc ! h264parse ! rtph264pay ! webrtcbin
+```
+
+The skeleton (webrtcbin, audio, ICE, RTP) is **shared** with monitor mode, and camera
+switching still replaces only the capture segment. Three things differ: boxes are burned
+into the stream, there is no teleoperation DataChannel, and the page hides the command
+bar. Audio and camera switching remain available.
+
+Board-side extras:
+
+```bash
+sudo apt install python3-opencv          # 4.5.4 on the board image
+# rknn-toolkit-lite2 comes from the vendor image; default model path is in src/detect_mode.py
+```
+
+Start it (default model: `/userdata/rknn_yolov5_demo/model/RK3588/yolov5s-640-640.rknn`):
+
+```bash
+MODE=detect tools/run-agent.sh
+
+# under service.sh the variable reaches the login shell; alternatively put
+# MODE=detect in .env and every `tools/service.sh restart agent` stays detect:
+MODE=detect tools/service.sh restart agent
+
+# or explicitly:
+#   python3 -s src/device_agent.py ... --mode detect --detect-fps 5
+```
+
+`tools/run-agent.sh` switches to `python3 -s` in detect mode: the board's system numpy
+is 1.21.5 (the ABI `python3-opencv` was built against), while a numpy 2.x in the user
+site would shadow it and make `import cv2` fail with an ABI error. `-s` skips the user
+site (`PYTHONNOUSERSITE=1` is equivalent).
+
+Only class **person** (index 0 of YOLOv5s's 80 classes) is drawn. Inference runs at
+`--detect-fps` (default 5); frames in between reuse the previous boxes and are pushed
+normally, so the video stays at the camera rate. White balance is applied on the BGR
+frame and only for MIPI; USB cameras have their own AWB.
 
 ### Public deployment (current shape)
 
@@ -359,6 +411,11 @@ routing, and why `/ws/publish` deliberately stays outside Basic Auth.
 | `--camera-ctl analogue_gain=176,exposure=1648` | Write sensor controls directly, no closed loop |
 | `--ice-policy relay` | Force TURN; used to prove the relay path actually works |
 | `--no-audio` | Video-only mode for boards without a usable microphone |
+| `--mode detect` | Lightweight direct mode: OpenCV + RKNN, boxes burned in, no teleop channel |
+| `--detect-model <path>` | `.rknn` model for detect mode (default in `src/detect_mode.py`) |
+| `--detect-fps 5` | Inference rate, decoupled from video fps; in-between frames reuse boxes |
+| `--detect-conf 0.35` / `--detect-iou 0.45` | Confidence floor / NMS IoU threshold |
+| `--camera-source usb` | Which camera to start with; runtime switching still works from the page |
 
 ## Verification
 
@@ -382,6 +439,15 @@ python3 tools/test_signal_server.py
 
 # Headless peer: real offer/answer, audio and DataChannel, no browser
 python3 tools/selftest.py --signal https://<vps> --room <room> --duration 20
+
+# Detect mode: pure functions/model (host is enough; --model runs real inference)
+python3 tools/check_detect_mode.py
+python3 -s tools/check_detect_mode.py --model /path/to/yolov5s.rknn --image bus.jpg
+
+# Detect mode end-to-end: agent running in detect mode with a viewer attached;
+# checks that frames/inferences/boxes in /stats are growing, then optionally switches
+bash tools/check_detect_mode.sh --base https://<board>:8443
+bash tools/check_detect_mode.sh --expect-boxes --switch-to usb
 ```
 
 Diagnostics are collected rather than asserted: the page posts 1 Hz `getStats()`

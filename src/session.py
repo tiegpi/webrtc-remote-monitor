@@ -391,8 +391,12 @@ class DeviceSession:
 
         video_source / video_switches 是"板子真的换了那一段"的设备侧判据 ——
         浏览器那边的画面变化可以被很多原因解释，这两个数是直接证据。
+
+        detect 模式额外带一组检测计数（detect_*）。monitor 模式不加任何 detect_*
+        字段，免得 analyze_diag.py 把旧的样本当成"检测没跑"。
         """
-        return {
+        snap = {
+            "mode": getattr(self.args, "mode", "monitor"),
             "video_packets_out": self.n_packets_out,
             "video_bytes_out": self.n_bytes_out,
             "video_source": self.current_source().name,
@@ -410,6 +414,9 @@ class DeviceSession:
             "teleop_last_seq": self.last_teleop_seq,
             "teleop_last_cmd": self.last_teleop_cmd,
         }
+        if self.switch is not None and hasattr(self.switch, "detect_counters"):
+            snap.update(self.switch.detect_counters())
+        return snap
 
     # ---------------- GStreamer 总线 ----------------
     def _on_bus_message(self, _bus, message):
@@ -477,7 +484,12 @@ class DeviceSession:
         # **DataChannel 必须在 create-offer 之前建**，否则不会写进这份 SDP。
         # 这一步能走到就说明 pipeline 已经 PLAYING 了 —— 更早调用时
         # create-data-channel 会静默返回 None（只在日志里留一行 assertion）。
-        if self.dc is None:
+        #
+        # detect 模式是纯监视，没有机器人可遥操作，页面也会把命令台藏起来，
+        # 所以不建这条通道，SDP 更干净。monitor 模式的行为一个字节都没变。
+        if getattr(self.args, "mode", "monitor") == "detect":
+            log.info("detect 模式：不建遥操作 DataChannel（纯监视，没有命令台）")
+        elif self.dc is None:
             try:
                 self.dc = element.emit("create-data-channel", "teleop", None)
             except Exception:                # noqa: BLE001
@@ -519,11 +531,18 @@ class DeviceSession:
 
         换摄像头会重建整段采集链，旧元素随旧 bin 一起销毁。只在 start() 里绑
         一次的话，切换之后命令仍会 ACK（DC 还在），画面却不再出字。
+
+        detect 模式**没有** textoverlay：检测框和白平衡都在 Python 桥里做，
+        而且页面已经把命令台藏起来了。这里只记一行 info，不要报 error ——
+        否则每建一次会话都刷一条"叠加层丢了"，看起来像坏了。
         """
         self.overlay = (self.pipeline.get_by_name("teleop")
                         if self.pipeline is not None else None)
         if self.pipeline is not None and self.overlay is None:
-            log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
+            if getattr(self.args, "mode", "monitor") == "detect":
+                log.info("detect 模式：没有 textoverlay（框由 OpenCV 烧进画面）")
+            else:
+                log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
 
     def _dc_state(self):
         if self.dc is None:

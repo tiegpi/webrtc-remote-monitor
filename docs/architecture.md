@@ -176,6 +176,7 @@ src/
   device_agent.py   板子侧发布端：连信令、收观看端、建会话、控制端点
   session.py        一路会话：pipeline + webrtcbin + 信令（一个观看端 = 一个）
   pipeline.py       GStreamer 管线：骨架 + 可替换的采集段
+  detect_mode.py    --mode detect：appsink→OpenCV/RKNN→appsrc 桥，框烧进画面
   sources.py        摄像头源表：这块板子上有哪几路、各自要什么
   camera.py         画质兜底·亮度：板子没有 3A，曝光自己闭环
   whitebalance.py   画质兜底·白平衡：同一个根因的另一半
@@ -198,6 +199,8 @@ tools/
   check_switch.sh             切换摄像头那组 13 条判据
   check_fd.sh                 会话拆除后设备 fd 有没有还回去
   check_teleop.py             遥操作协议单测（宿主机，无 GStreamer）
+  check_detect_mode.py        detect 预处理/解码/NMS/白平衡单测（可带 --model 真推理）
+  check_detect_mode.sh        detect 端到端：轮询 /stats，验证检测与切换后仍在跑
   check_textoverlay.py        textoverlay 三种采集组合的帧率实测（板子）
   check_audio.sh check_offer.py selftest.py turn_check.py freeze_stats.py …
                              单项排查工具
@@ -253,6 +256,56 @@ MIPI（OV13850）在**这块板子上**是弱势的一方，因为板子上**没
 **这解释了一个不对称**：切到 USB 是一步到位，切回 MIPI 有几秒画面在爬
 （曝光闭环 + 白平衡前 15 帧要重跑）。而且顺序必须"先设曝光、再自校准" ——
 校准帧曝光不对，算出的增益就是错的。
+
+### detect 模式：在采集段和骨架之间插一个 Python 桥
+
+`--mode detect` 让图像先过 OpenCV + RKNN，再进同一条编码/推流路径。板子上没有
+"OpenCV 元素"或"RKNN 元素"可挂，所以桥是一段 Python 线程，两头分别接 appsink
+和 appsrc：
+
+```
+采集段（可换）                                    骨架（永不动）
+v4l2src ! caps ! [mppjpegdec] ! videoconvert ! BGR ! appsink
+                                                       │
+                                      DetectBridge 线程（每段一个）
+                                        · 取 buffer，按 stride 拷成 ndarray
+                                        · MIPI 首次 15 帧灰世界校准，之后逐帧 LUT
+                                        · 按 --detect-fps 推理，中间帧复用上一帧的框
+                                        · cv2.rectangle 把框烧进 BGR 像素
+                                                       │
+appsrc ! videoconvert ! mpph264enc ! h264parse ! rtph264pay ! webrtcbin
+```
+
+**切分点从 `h264parse` 之后挪到了 appsink/appsrc 之间，但"骨架 / 采集段"的边界
+语义没变**：换摄像头仍然只拆采集段 + 它的桥，`appsrc` 之后的编码器、payloader、
+`webrtcbin` 以及 ICE/音频全部原地不动。`DetectSwitch` 对外接口和
+`pipeline.VideoSwitch` 一致，`session.py` 不需要知道拿的是哪一种。
+
+几个刻意的选择：
+
+- **RKNN 归桥所有，在桥线程里 load/infer/release。** 历史上 `rknn.release()` 在
+  GLib 线程调用会把进程带崩；让创建和使用它的线程负责释放，这条路径就只剩一种
+  线程。切摄像头时 `stop()` 先 join 线程，`release()` 在 `finally` 里跑完，才拆段。
+- **appsrc 的属性是实测定下来的**：`block=false` + `leaky-type=downstream`。测过
+  10 个 buffer 压进 `max-buffers=2`：`leaky-type=none` 队列涨到 10（上限形同虚设），
+  `upstream` 满了会让 push 返回 EOS（桥会误以为流结束），`block=true` 则让桥卡在
+  push 里、切换时 join 不掉。
+- **不碰 `GstVideo.VideoInfo.from_caps()`**。映射到的 buffer 可能带行对齐填充，桥
+  改用 `buffer size / height` 反推 stride（`frame_stride`），避开那个老段错误。
+- **推理频率和视频帧率解耦**。默认 5 fps 推理，中间帧原样推（有框时只重画，不重算），
+  所以视频还是 20–30 fps，NPU 只吃它需要的量。
+- **detect 模式不建遥操作 DataChannel**。框已经证明视频路径活着，但没有机器人可
+  遥控；页面把命令台藏起来。音频回程不受影响。
+
+**验证不靠人眼**：`/stats` 把桥里的计数（`detect_frames`、`detect_inferences`、
+`detect_boxes`、`detect_errors`、`detect_last_ms`）和会话计数放在一起返回。
+桥是每段一个、计数从 0 开始，`DetectSwitch` 在换桥前把旧桥的账结进累计值，所以
+换摄像头不会让 `/stats` 倒退 —— 否则看起来就像"一换源检测就停了"。
+
+**numpy 的 ABI 是这块板子上最容易踩的坑**：系统的 `python3-opencv` 按 numpy 1.21.5
+编译，用户目录里若装了 2.x 会先被加载，`import cv2` 直接抛
+"compiled using NumPy 1.x cannot be run in NumPy 2.x"。`tools/run-agent.sh` 在
+detect 模式下用 `python3 -s`；monitor 模式不加 `-s`，行为与以前完全一致。
 
 ---
 
@@ -393,7 +446,10 @@ VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 u
 ┌─ 主线程 ──────────── asyncio 事件循环，跑 WebSocket 收发
 │                        on_signal() 在这里被调用
 │
-└─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+├─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+│
+└─ detect-bridge 线程 ── 仅 detect 模式：每段采集一个，appsink → OpenCV/RKNN → appsrc
+                          RKNN 的 load/infer/release 都在这条线程上
 ```
 
 GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能在 asyncio 线程里写。
@@ -406,6 +462,11 @@ GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能�
 
 不要在别的任何地方跨线程碰对方的对象。切摄像头是第三个例子：它只能在 GLib 线程
 调用，所以 HTTP 端点用 `GLib.idle_add` 投递、用 `loop.call_soon_threadsafe` 回填结果。
+
+detect 模式的桥线程是**有意加**的第三条线程：它在 GLib 线程里被创建和 `stop()`，
+但只碰 appsink/appsrc（GStreamer 的 appsink/appsrc 本身允许跨线程 pull/push）和它
+自己的 RKNN 上下文。切段时先在 GLib 线程 join 它，再拆 appsink —— 顺序反了会让
+线程攥着一个已经无效的 buffer，v4l2 的 pool 和设备 fd 就留在原地。
 
 **单观看端**：本项目按遥操作场景设计，同一时刻只允许一个观看端，所以代码里没有
 viewer id 那套东西。第二个观看端会被回"本设备同时只接受一个观看端"。
