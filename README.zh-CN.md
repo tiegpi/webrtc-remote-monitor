@@ -41,7 +41,8 @@ DTLS/SRTP + ICE，局域网直连，跨网时由 coturn 中继兜底。同一份
 | **双向语音** | 板子麦克风 → 浏览器；浏览器麦克风 → 板子 3.5 mm 输出。两个方向分别计数 |
 | **遥操作** | 白名单命令走 DataChannel，每条都有 ACK/NACK；命令同时被写进**视频画面左上角**，文字只能由板子产生 |
 | **局域网 / 公网两种部署** | 同一个 `signal_server.py`：板子上跑就是局域网模式，VPS 上跑配 coturn 就是公网模式 |
-| **可验证** | 13 / 17 / 22 条验收判据、切换专项 13 条、设备 fd 回收检查、无头对端自测 |
+| **ROS 2 模式（可选）** | `--mode ros`：采集、推理各是一个 ROS 节点，图像和检测结果走话题总线，WebRTC 只负责把标注图推给浏览器。见下文「ROS 模式」 |
+| **可验证** | 13 / 17 / 22 条验收判据、切换专项 13 条、设备 fd 回收检查、无头对端自测、ROS 模式 35 条单测 |
 
 单观看端是**设计约束**，不是遗漏：遥操作场景只需要一个操作者，所以只有一条会话、一条
 管线，也没有多路广播和 PiP。
@@ -115,6 +116,117 @@ Orange Pi 5 上没有 Rockchip 的 `rkaiq_3A_server`，AE/AWB 都在那个用户
 | 板端 `teleop_overlay` 跟得上 ACK | ACK 是真的，但视频那道环已经死了 |
 | 板端 `teleop_rx` 和页面 `sent` 对得上 | 页面自己发、自己记账、自己判自己过 |
 
+## ROS 模式：图像走话题总线
+
+`--mode ros` 把同一条 WebRTC 链路接到 ROS 2 话题上：**采集和推理各是一个普通 ROS
+节点**，推流端退化成"订阅标注图 + 编码 + 推流"。设计意图是让检测结果能被机器人生态里
+别的节点（规划、控制）直接用，而不是锁在推流进程里。
+
+```
+camera_node ──/camera/image_raw──> detector_node ──/detect/image_annotated──┐
+    │                                  │                                     │
+    │ /camera/source（latched 回报）    │ /detect/persons（JSON）              │
+    └── /camera/select（切源请求）      └─────────────────────────────────────┘
+                                                                              ▼
+                                                    device_agent --mode ros
+                                                    RosLink  ：切源、回报、检测统计
+                                                    RosBridge：订阅标注图 → appsrc
+                                                      → videoconvert → mpph264enc
+                                                      → rtph264pay → webrtcbin
+```
+
+三个进程，边界就是话题：
+
+| 话题 | 类型 | 方向 | 说明 |
+|---|---|---|---|
+| `/camera/image_raw` | `sensor_msgs/Image`（`bgr8`） | camera_node → detector_node | 原始画面，720p |
+| `/detect/image_annotated` | `sensor_msgs/Image`（`bgr8`） | detector_node → agent | 框已经烧进画面 |
+| `/detect/persons` | `std_msgs/String`（JSON） | detector_node → 任何节点 | 人框、置信度、推理耗时 |
+| `/camera/select` | `std_msgs/String` | agent → camera_node | 请求换一路 |
+| `/camera/source` | `std_msgs/String`（latched） | camera_node → agent | **真的**开成了哪一路 |
+
+检测结果用 `std_msgs/String` 而不是自定义消息：板子上没有外网，rosidl 自定义类型要
+单独编一个包，而规划/控制节点 `json.loads` 一下就能用。
+
+```json
+{"count": 1, "inference_ms": 23.4,
+ "stamp": {"sec": 1793021234, "nanosec": 512000000},
+ "frame": {"height": 720, "width": 1280},
+ "boxes": [{"label": "person", "score": 0.87, "x1": 512, "y1": 96, "x2": 704, "y2": 611}]}
+```
+
+### 三步跑起来
+
+```bash
+tools/build-ros-ws.sh            # colcon build --symlink-install，改 Python 不用重编
+tools/run-ros-nodes.sh           # camera_node + detector_node（前台）
+MODE=ros tools/service.sh restart agent   # 推流端，订阅 /detect/image_annotated
+```
+
+两边顺序无所谓：节点没起时 agent 只是没画面，节点起来就有了。要换分辨率：
+
+```bash
+tools/run-ros-nodes.sh width:=640 height:=480   # 同时改 agent 的 --width/--height
+```
+
+**宽高必须两边一致**。appsrc 的 caps 是写死的，话题上的尺寸对不上会被逐帧丢掉 ——
+`ros2 topic hz` 看着有 30 Hz，浏览器是黑的，`/stats` 里 `ros_errors` 在涨。
+`tools/check_ros_mode.sh` 的第一条判据就是防这个。
+
+### 为什么拆三个进程
+
+- **检测坏不拖死预览。** 模型缺失、NPU 初始化失败时 `detector_node` 照样把原图当标注图
+  转发，只是没有框 —— 和 detect 模式的取舍一致，否则排查方向会被带偏到 WebRTC 上。
+- **节点重启不打断会话。** 推流会话、ICE、音频都在 agent 里；重启 `camera_node` 只是
+  画面停几秒，浏览器不用重连。
+- **订阅按需建。** 没有观看端时不订阅标注图，也就不为 720p 做任何额外拷贝；切源和
+  检测统计不依赖会话（页面上没人在看按钮也一直在）。
+
+### 切源在 ROS 模式下也不是本地动作
+
+摄像头在 `camera_node` 手里，agent 碰不到采集段，也不该去抢设备节点。页面点按钮 →
+agent 发一条 `/camera/select` → 等 `camera_node` 开好新设备、跑完亮度闭环、**发出第一帧
+之后**才回报 `/camera/source`（最多等 8 秒）。HTTP 响应里的 `applied` 就是"有没有等到
+这条回报"：发布消息谁都会成功，设备侧的事实才算数。等不到时如实回 `applied: false`。
+
+### 和 monitor 模式的差别
+
+| | monitor（默认） | ros |
+|---|---|---|
+| 采集 / 推理 | 本进程内 | `camera_node` / `detector_node` |
+| 画框 | `textoverlay` 烧进 H.264 | `detector_node` 用 OpenCV 画在帧上 |
+| 遥操作命令台 | 有（DataChannel + 画面文字） | **没有**（总线上的画面不该被单方面叠加） |
+| 切源 | 换采集段，不重协商 | 发话题，设备侧重开 |
+| 信令 / ICE / 音频回程 / 会话 | 完全同一份代码 | 完全同一份代码 |
+
+### 验收
+
+```bash
+python3 tools/check_ros_mode.py                       # 宿主机，35 条，不需要 ROS/GStreamer/NPU
+bash tools/check_ros_mode.sh --switch-to usb          # 板子上，读 agent 的 /stats
+```
+
+板子上的判据是**设备侧的账**：`ros_frames`（话题 → appsrc 的帧）、`video_packets_out`
+（真正发出去的 RTP）、`ros_errors`（0）、`ros_source`（camera_node 回报的源）。单看任何
+一条都能骗人 —— 帧在涨但 RTP 不动是编码器/webrtcbin 的问题，RTP 在涨但帧不动说明画面
+早停住了、浏览器还挂着最后一帧，所以两条都要求涨。
+
+### 注意
+
+- **带宽**：1280×720 的 `bgr8` 每秒约 **55 MB**，本机回环没问题，跨机器跑 DDS 要算上
+  这条；跨机器只想要结果的话，订阅 `/detect/persons` 就够，别订阅图像。
+- **USB（MJPG）默认软件解码。** 这块板子的 `mppjpegdec` 解 720p MJPG 实测 ≈1.5 秒/帧，
+  而且**不报错**（同一个设备 `v4l2src` 直出 16 fps，换 `jpegdec` 也还是 16 fps）。所以
+  `camera_node` 默认 `camera_decoder=sw`，约一个核；确认 MPP 正常的板子可以
+  `tools/run-ros-nodes.sh camera_decoder:=mpp` 把那一个核省回来。MIPI（raw）不受影响。
+- **模型不入库**（`.rknn` 已 gitignore）。用 `model:=...` 指到板子上现有的那份。
+- **ROS 模式必须 `source /opt/ros/humble/setup.bash`，并且屏蔽用户目录的 numpy**：板子的
+  系统 numpy 是 1.21（`python3-opencv` 按它编的），用户目录里还装着一个 numpy 2.x，会让
+  `import cv2` 直接抛 ABI 报错。agent 用 `python3 -s`，节点用 `PYTHONNOUSERSITE=1`
+  （`ros2 launch` 起的子进程没法加 `-s`）。`tools/run-agent.sh` 和
+  `tools/run-ros-nodes.sh` 都替你处理了。
+- **单观看端**仍是设计约束，两种模式一样。
+
 ## 实测数据
 
 | 指标 | 数值 | 说明 |
@@ -142,6 +254,17 @@ sudo apt install python3-gi python3-aiohttp python3-numpy \
 ```
 
 `numpy` 只有 `--camera-wb` 需要。可 pip 管理的部分见 [requirements.txt](requirements.txt)。
+
+用 ROS 模式（`--mode ros`）时再加这些，都在 apt / 厂商镜像里，pip 装不了：
+
+```bash
+sudo apt install ros-humble-ros-base python3-colcon-common-extensions \
+    python3-opencv python3-numpy
+# rknn-toolkit-lite2 来自板子厂商镜像；模型 .rknn 不入库
+```
+
+ROS 模式要 source `/opt/ros/humble/setup.bash` 并用 `python3 -s` 跑，
+`tools/run-agent.sh` 和 `tools/run-ros-nodes.sh` 都会替你处理。
 
 ### 局域网（不需要 VPS）
 
@@ -343,6 +466,7 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && tools/service.sh restart'
 
 | 参数 | 作用 |
 |---|---|
+| `--mode ros` | 图像走 ROS 话题总线（见上文「ROS 模式」）。默认 `monitor` |
 | `--gop 10` | 切换后最多等一个 IDR；改成 60 会让"画面静止时间占比"超验收上限 |
 | `--camera-wb auto` | 板子没有 AWB 时的灰世界校正；校准时镜头对着白墙/灰色表面 |
 | `--camera-ctl analogue_gain=176,exposure=1648` | 直接写 sensor 控件，不做闭环 |
@@ -370,6 +494,12 @@ python3 tools/test_signal_server.py
 
 # 无头对端：真实 offer/answer、音频和 DataChannel，不需要浏览器
 python3 tools/selftest.py --signal https://<VPS> --room <房间> --duration 20
+
+# ROS 模式单测（宿主机，35 条；不需要 ROS / GStreamer / NPU）
+python3 tools/check_ros_mode.py
+
+# ROS 模式整链路（板子上跑，先起节点和 agent，并挂一个观看端）
+bash tools/check_ros_mode.sh --switch-to usb
 ```
 
 诊断数据是**收集**而不是断言：页面 1 Hz 上报 `getStats()` 摘要（含一张 32×18 的亮度
@@ -399,24 +529,30 @@ src/
   device_agent.py    推流端：信令、会话生命周期、遥测、本地控制 socket
   session.py         一路会话：pipeline + webrtcbin + DataChannel + 信令
   pipeline.py        GStreamer 管线：常驻骨架 + 可替换采集段
+  ros_mode.py        ROS 模式的另一端：订阅标注图 → appsrc、发切源请求、读检测统计
   sources.py         摄像头表：设备节点、原生格式、要不要画质兜底
   camera.py          亮度闭环（板子没有 AE）
   whitebalance.py    灰世界白平衡桥（板子没有 AWB）
   audio.py           ALSA 设备探测与电平检查
   signal_server.py   信令 + /ice.json + 诊断样本（局域网 / VPS 同一份）
-  web_server.py      页面服务 + 同源代理（/ws/view、/ice.json、/diag、/camera）
+  web_server.py      页面服务 + 同源代理（/ws/view、/ice.json、/diag、/camera、/stats）
   teleop.py          命令协议：白名单、校验、ACK/NACK、画面文案
   sdpview.py         SDP → 人话（工具共用）
+ros2_ws/
+  src/webrtc_detect/ ROS 2 包：camera_node、detector_node、detector_core、launch/
 web/
   monitor.html       整个观看页：单文件、无构建步骤
 tools/
   service.sh         板子服务管理：start / stop / restart / status / logs
   service_vps.sh     在开发机上管理 VPS 的 systemd 服务
   run-agent.sh run-web.sh  前台启动（调试用）
+  build-ros-ws.sh    colcon build --symlink-install
+  run-ros-nodes.sh   起 camera_node + detector_node（ROS 模式那一半）
   deploy_vps.sh      VPS：信令 + coturn
   deploy_web_vps.sh  VPS：观看页服务 + nginx 路由
   gen_cert.sh        板子自签证书
   analyze_diag.py    主验收判据
+  check_ros_mode.py / check_ros_mode.sh  ROS 模式的单测 / 整链路验收
   check_* / selftest.py / turn_check.py …  专项排查工具
 docs/architecture.md 深潜水：拓扑、线程模型、静默失败记录
 ```
@@ -430,6 +566,10 @@ docs/architecture.md 深潜水：拓扑、线程模型、静默失败记录
 - **管线骨架不会立刻回收**。设备 fd 已经不漏（有 `check_fd.sh` 判据），但跨 C/Python
   的闭包环让骨架在会话之间继续活着（每轮几百 KB）。见架构文档第十一节。
 - **MIPI 画质受 sensor 限制**。暗房间里闭环也只能到 Y≈78，真正解决只能加光或换 sensor。
+- **ROS 模式的宽高是两边写死的约定**。`camera_node` 发布的尺寸必须和 agent 的
+  `--width/--height` 一致，没有自动跟随；不一致时是"话题有帧、浏览器黑屏"。
+- **ROS 模式没有遥操作命令台**。总线上的画面是给所有节点看的，单方面把命令文字烧进去
+  不是一个节点该做的事；需要的话应该在页面侧叠加。
 
 ## 许可
 

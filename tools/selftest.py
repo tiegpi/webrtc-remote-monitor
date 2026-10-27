@@ -338,8 +338,18 @@ class Peer:
             ).format(freq=self.args.freq, rate=AUDIO_RATE, pt=PT_AUDIO,
                      ssrc=SSRC_AUDIO)
 
-        self.pipeline = Gst.parse_launch(desc)
-        self.webrtcbin = self.pipeline.get_by_name("wbr")
+        parsed = Gst.parse_launch(desc)
+        # `--no-send-audio`（以及 ROS 模式这种本来就没音频的场合）desc 里只剩
+        # webrtcbin 一个元素，parse_launch **不会**再套一层 GstPipeline，而是把
+        # 这个元素原样返回 —— 它没有 bus，后面 add_signal_watch 就会炸。所以
+        # 这种情况自己补一层 pipeline；元素本身 set_state/add 都照常能用。
+        if isinstance(parsed, Gst.Pipeline):
+            self.pipeline = parsed
+            self.webrtcbin = parsed.get_by_name("wbr")
+        else:
+            self.pipeline = Gst.Pipeline.new("selftest")
+            self.pipeline.add(parsed)
+            self.webrtcbin = parsed
         if self.webrtcbin is None:
             raise RuntimeError("parse_launch 没建出 webrtcbin")
 

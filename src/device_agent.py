@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -38,6 +39,7 @@ from gi.repository import GLib
 import audio             # 音频设备探测：判错设备不会报错，只会推一路本底噪声
 import camera            # 画质兜底：板子没有 3A，亮度只能自己闭环
 import pipeline          # 必须早于 Gst.init()：它会在导入时清掉 BSP 埋的环境变量
+import ros_mode          # ROS 模式：rclpy 节点 + 话题→appsrc 的桥（重依赖在内部惰性 import）
 import sources           # 板子上有哪些摄像头、各自要什么
 import whitebalance      # 画质兜底：同一根因的另一半 —— ISP 没跑 AWB，画面偏绿
 from session import DeviceSession
@@ -209,6 +211,9 @@ async def handle_camera(request):
         return web.json_response({
             "available": sources.available(),
             "current": state.current_name(),
+            # 页面靠它决定显示 monitor 还是 ros：ros 模式的画面由 ROS 节点
+            # 负责（框已经烧进去），命令台没有意义，页面要把它藏起来。
+            "mode": getattr(state.args, "mode", "monitor"),
         })
 
     try:
@@ -237,6 +242,9 @@ async def handle_camera(request):
         return web.json_response(
             {"ok": False, "error": "设备 %s 不存在（摄像头没插好？）" % src.device},
             status=409)
+
+    if getattr(state.args, "mode", "monitor") == "ros":
+        return await handle_camera_ros(state, src)
 
     async with state.lock:
         if state.current_name() == src.name and state.session is not None:
@@ -272,11 +280,89 @@ async def handle_camera(request):
         return web.json_response({"ok": True, "current": applied, "applied": True})
 
 
+async def handle_camera_ros(state, src):
+    """ROS 模式下的切源：发一条 /camera/select，再等 camera_node 的回报。
+
+    **为什么不本地切**：设备在 camera_node 手里。本进程碰不到采集段，
+    也不该去抢设备节点 —— 两边各开一次 /dev/video11，先开的那个会赢，
+    输的那个报 "Device or resource busy"，而症状看起来像"切过去黑屏"。
+
+    回报是必须等的：发布一条消息谁都会成功，camera_node 有没有真的重开
+    设备、开成哪一路，只有它自己的 /camera/source 算数。等不到就**如实
+    说没等到**，而不是回一个 applied=true 让页面以为切好了。
+    """
+    args = state.args
+    link = getattr(args, "ros_link", None)
+    if link is None:
+        return web.json_response(
+            {"ok": False, "error": "ROS 节点没起来（rclpy 初始化失败？）"},
+            status=503)
+
+    async with state.lock:
+        session = state.session
+        if session is not None and not session.stopped:
+            if state.current_name() == src.name:
+                return web.json_response(
+                    {"ok": True, "current": src.name, "applied": False,
+                     "note": "已经在这一路上"})
+            try:
+                # RosSwitch.switch 只负责发请求，不阻塞 GLib 线程。
+                await run_on_glib(session.switch_source, src.name)
+            except Exception as exc:        # noqa: BLE001
+                log.exception("ROS 切源请求发布失败")
+                return web.json_response(
+                    {"ok": False, "error": str(exc)}, status=500)
+        else:
+            # 没有观看端：没有会话可发，直接在这个长驻节点上发请求。
+            link.select(src.name)
+
+        # 等回报要几秒钟（camera_node 要拆旧管线、跑亮度闭环、开新管线），
+        # 放线程池里等，别堵 asyncio 事件循环。
+        ok, got = await asyncio.get_running_loop().run_in_executor(
+            None, link.wait_source, src.name, ros_mode.SWITCH_TIMEOUT)
+
+    state.source = src
+    payload = {"ok": True, "current": got or src.name, "applied": bool(ok)}
+    if not ok:
+        payload["note"] = (
+            "切源请求已发到 %s，但 %.0f 秒内没等到 camera_node 的回报。"
+            "它在跑吗（tools/run-ros-nodes.sh）？设备是不是被别的进程占着？"
+            % (args.ros_select_topic, ros_mode.SWITCH_TIMEOUT))
+        log.warning("%s", payload["note"])
+    return web.json_response(payload)
+
+
+async def handle_stats(request):
+    """GET /stats = 板子侧当前的会话计数（和 1Hz 遥测同一份）。
+
+    没有观看端时返回 session=null，而不是一个空对象 —— 那能一眼区分"没人在看"
+    和"会话在跑但计数是 0"。ROS 模式的 ros_* 字段只有那边才有；ROS 节点
+    自己的状态（用哪个源、检测节点报了几个人）不依赖会话，所以放在外面。
+    """
+    state = request.app["state"]
+    mode = getattr(state.args, "mode", "monitor")
+    session = state.session
+    payload = {"ok": True, "mode": mode, "source": state.current_name()}
+
+    if mode == "ros":
+        link = getattr(state.args, "ros_link", None)
+        if link is not None:
+            payload["ros"] = link.status()
+
+    if session is None or session.stopped:
+        payload["session"] = None
+        return web.json_response(payload)
+
+    payload["session"] = session.counters()
+    return web.json_response(payload)
+
+
 async def start_control(state):
     """起本地控制端点。返回 AppRunner，由调用方在退出时 cleanup。"""
     app = web.Application()
     app["state"] = state
     app.router.add_route("*", "/camera", handle_camera)
+    app.router.add_get("/stats", handle_stats)
 
     path = socket_path(state.args)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +376,7 @@ async def start_control(state):
     await web.UnixSite(runner, str(path)).start()
     # 只有本机、而且只有跑 web_server 的那个用户可以调它。
     os.chmod(path, 0o600)
-    log.info("控制端点 %s（GET/POST /camera）", path)
+    log.info("控制端点 %s（GET/POST /camera，GET /stats）", path)
     return runner
 
 
@@ -547,6 +633,19 @@ async def run_publisher(args, state):
     log.info("视频源 %s（%s）  %dx%d@%d  %s  %d kbps",
              src.name, src.device, args.width, args.height, args.fps,
              src.fourcc, args.bitrate // 1000)
+    if args.mode == "ros":
+        log.info("模式 ros：图像走 ROS 话题总线，本进程只订阅 + 推流")
+        log.info("  标注图 %s → WebRTC（期望 %dx%d bgr8；"
+                 "和 camera_node 的分辨率不一致会逐帧被丢掉）",
+                 args.ros_image_topic, args.width, args.height)
+        log.info("  切源请求 %s，当前源回报 %s（camera_node 自己打开设备，"
+                 "本进程不跑画质兜底）",
+                 args.ros_select_topic, args.ros_source_topic)
+        log.info("  检测结果 %s（std_msgs/String JSON，只是拿来看人数/耗时）",
+                 args.ros_persons_topic)
+        log.info("  ROS 模式不建 DataChannel：命令台不启用，画面由 ROS 节点负责")
+    else:
+        log.info("模式 monitor：采集后直接硬件编码（语音 + 遥操作命令台可用）")
     log.info("  可切换的源：%s（页面上有按钮，走板子本地的控制通道）",
              "、".join("%s=%s" % (s.name, s.device) for s in sources.SOURCES))
     if args.no_audio:
@@ -622,6 +721,21 @@ def parse_args(argv=None):
     g.add_argument("--ice-policy", default="all", choices=["all", "relay"],
                    help="relay = 强制走 TURN。用来验证中继真的生效")
 
+    m = p.add_argument_group("运行模式（同一条 WebRTC 链路，视频前端不同）")
+    m.add_argument("--mode", choices=["monitor", "ros"], default="monitor",
+                   help="monitor = 采集后直接硬件编码（推流 + 语音 + 遥操作）；"
+                        "ros = 图像走 ROS 话题总线，采集/推理分别由 camera_node、"
+                        "detector_node 承担，本进程只订阅标注图并推流"
+                        "（节点见 ros2_ws/src/webrtc_detect/）")
+    m.add_argument("--ros-image-topic", default=ros_mode.IMAGE_TOPIC_DEFAULT,
+                   help="要推流的图像话题（sensor_msgs/Image，bgr8 或 rgb8）")
+    m.add_argument("--ros-persons-topic", default=ros_mode.PERSONS_TOPIC_DEFAULT,
+                   help="检测结果话题（std_msgs/String JSON），只用于 /stats")
+    m.add_argument("--ros-select-topic", default=ros_mode.SELECT_TOPIC_DEFAULT,
+                   help="切源请求话题（std_msgs/String），由 camera_node 订阅")
+    m.add_argument("--ros-source-topic", default=ros_mode.SOURCE_TOPIC_DEFAULT,
+                   help="camera_node 回报当前源的话题（latched，晚启动也拿得到）")
+
     c = p.add_argument_group(
         "摄像头（两个源都能用，观看页上可以随时切，见 src/sources.py）。"
         "宽高帧率对**所有**源一视同仁：切换不用重新协商，靠的就是两路编码输出"
@@ -689,6 +803,11 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    """SIGTERM 处理器：让收尾路径和 Ctrl-C 完全一致。"""
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
     args = parse_args(argv)
     logging.basicConfig(
@@ -708,9 +827,23 @@ def main(argv=None):
                       "       --camera-wb 1.71,1.55    手动给 R、B 的增益（G 固定为 1）",
                       whitebalance.WB_CALIB_FRAMES)
             return 2
-        problem = whitebalance.check_available()
+        if args.mode == "ros":
+            # ROS 模式的画面来自话题，白平衡在 camera_node 里做（它在 BGR 帧上
+            # 用同一套灰世界算法）。本进程这条 appsrc 链里没有可校正的采集帧。
+            log.info("ROS 模式：--camera-wb 只对 camera_node 有意义，"
+                     "本进程不做白平衡（把它传给 launch 的 camera_wb 参数）")
+        else:
+            problem = whitebalance.check_available()
+            if problem:
+                log.error("--camera-wb 用不了：%s", problem)
+                return 2
+
+    # ROS 模式的依赖（rclpy / sensor_msgs）也在这里先验掉：等到观看端接入、
+    # 建 pipeline 时才发现没 source ROS 环境，会按观看者数重复报错。
+    if args.mode == "ros":
+        problem = ros_mode.check_available()
         if problem:
-            log.error("--camera-wb 用不了：%s", problem)
+            log.error("ROS 模式用不了：%s", problem)
             return 2
 
     # 音频设备在**启动时**定下来，不是每次建 pipeline 时：公网模式下每来一个
@@ -727,25 +860,60 @@ def main(argv=None):
     # 量亮度的那个 ISP 节点不会和正在推的流抢资源。
     # 只有 quality_fix 的源（MIPI）才真的跑它 —— USB 摄像头自带 AE/AWB，
     # 跑那套既没意义又会去写 MIPI sensor 的 subdev 控件。
+    #
+    # ROS 模式下摄像头在 camera_node 嘴里：本进程去写同一条 ISP 的 subdev
+    # 控件既越权又可能和它抢设备节点，整段跳过。
     state = AgentState(args)
-    sources.apply_quality(state.source, args, log)
+    if args.mode == "ros":
+        log.info("ROS 模式：画质兜底由 camera_node 在打开设备时做，本进程跳过")
+    else:
+        sources.apply_quality(state.source, args, log)
 
     from gi.repository import Gst
 
     # Gst.init() 必须在这里 —— pipeline 模块已经在导入时清掉了那个环境变量，
-    # 而 v4l2 插件是在创建 element 时读它的。
+    # 而 v4l2 插件是在创建元素时读它的。
     Gst.init(None)
+
+    # ROS 节点在进程寿命里只建一次（理由见 ros_mode.RosLink 的说明）。
+    # 必须在 asyncio/GStreamer 之前起：页面在没有观看端时也要能切源。
+    ros_link = None
+    if args.mode == "ros":
+        import rclpy
+        rclpy.init(args=None)
+        try:
+            ros_link = ros_mode.RosLink(args, log)
+            ros_link.start()
+        except Exception:                    # noqa: BLE001
+            log.exception("ROS 节点建不起来")
+            try:
+                rclpy.shutdown()
+            except Exception:                # noqa: BLE001
+                pass
+            return 2
+        args.ros_link = ros_link
 
     # GLib.MainLoop 跑在守护线程上，asyncio 跑在主线程。
     # GStreamer 的回调全部落在 glib 线程，跨线程投递见 session.py 的说明。
     glib_loop = GLib.MainLoop()
     threading.Thread(target=glib_loop.run, name="glib-main", daemon=True).start()
 
+    # rclpy.init() 把 SIGTERM 的默认动作（终止进程）换成了"关掉 context"，
+    # 进程自己不会退 —— service.sh stop 发完 TERM 要干等 10 秒再 SIGKILL。
+    # 装一个自己的处理器把 TERM 变成和 Ctrl-C 一样的 KeyboardInterrupt，
+    # 两种模式就都走下面这条收尾路径（停 ROS、停 GLib）。必须装在 rclpy.init 之后，
+    # 否则会被它覆盖掉。
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
     try:
         return asyncio.run(run_forever(args, state))
     except KeyboardInterrupt:
         return 0
     finally:
+        # 先停 ROS 再停 GLib：spin 线程可能还在往 appsrc 推帧，而 appsrc
+        # 的拆除在 GLib 线程上做。反过来的话会推一个已经析构的元素。
+        if ros_link is not None:
+            ros_link.stop()
         glib_loop.quit()
 
 

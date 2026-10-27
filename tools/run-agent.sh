@@ -1,8 +1,18 @@
 #!/bin/bash
 # 板子侧发布端。信令服务器在 VPS 上，经 nginx 443 反代（wss）。
 #
-#     tools/run-agent.sh            正常启动
+#     tools/run-agent.sh            正常启动（monitor 模式）
 #     tools/run-agent.sh --gop 30   追加/覆盖参数（后面的同名参数生效）
+#
+# 两种运行模式（--mode，也可以用环境变量 MODE 选）：
+#
+#   monitor  采集后直接交给硬件 H.264 编码：推流 + 双向语音 + 遥操作命令台。
+#            这是阶段一/二/三的行为，默认值。
+#
+#   ros      图像走 ROS 2 话题总线：camera_node 采集、detector_node 推理，本进程
+#            只订阅 /detect/image_annotated 并推给浏览器。切源、检测统计都走
+#            ROS 话题（见 ros2_ws/ 和 README「ROS 模式」）。
+#            本模式要 source /opt/ros/humble/setup.bash（下面会替你 source）。
 #
 # **--gop 不用在这儿写**：device_agent.py 的默认值就是 10，而整条验收线都压在
 # 那个值上（中途加入的浏览器、切换摄像头都要等下一个 IDR；60 会让
@@ -44,11 +54,58 @@ if [ -f .env ]; then . ./.env; fi
 # WebSocket 仍然只认 TOKEN，不要混用。
 : "${SIGNAL_AUTH:?没设 SIGNAL_AUTH（user:pass）—— 见 .env.example}"
 
-exec python3 src/device_agent.py \
-  --signal "wss://$SIGNAL_HOST/ws/publish" \
-  --room "$ROOM" \
-  --token "$TOKEN" \
-  --signal-auth "$SIGNAL_AUTH" \
-  --tls-ca certs/vps-self.crt \
-  --camera-wb auto \
-  "$@"
+# 运行模式。给默认值而不是强制要求：只想跑 monitor 的人不该为了一个不用的
+# 开关去改 .env。
+MODE="${MODE:-monitor}"
+CAMERA_SOURCE="${CAMERA_SOURCE:-}"
+ROS_IMAGE_TOPIC="${ROS_IMAGE_TOPIC:-}"
+ROS_PERSONS_TOPIC="${ROS_PERSONS_TOPIC:-}"
+ROS_SELECT_TOPIC="${ROS_SELECT_TOPIC:-}"
+ROS_SOURCE_TOPIC="${ROS_SOURCE_TOPIC:-}"
+
+case "$MODE" in
+  monitor|ros) ;;
+  *) echo "MODE 只能是 monitor 或 ros，收到：$MODE" >&2; exit 2 ;;
+esac
+
+ARGS=(
+  --signal "wss://$SIGNAL_HOST/ws/publish"
+  --room "$ROOM"
+  --token "$TOKEN"
+  --signal-auth "$SIGNAL_AUTH"
+  --tls-ca certs/vps-self.crt
+  --camera-wb auto
+  --mode "$MODE"
+)
+if [ -n "$CAMERA_SOURCE" ]; then ARGS+=(--camera-source "$CAMERA_SOURCE"); fi
+if [ -n "$ROS_IMAGE_TOPIC" ]; then ARGS+=(--ros-image-topic "$ROS_IMAGE_TOPIC"); fi
+if [ -n "$ROS_PERSONS_TOPIC" ]; then ARGS+=(--ros-persons-topic "$ROS_PERSONS_TOPIC"); fi
+if [ -n "$ROS_SELECT_TOPIC" ]; then ARGS+=(--ros-select-topic "$ROS_SELECT_TOPIC"); fi
+if [ -n "$ROS_SOURCE_TOPIC" ]; then ARGS+=(--ros-source-topic "$ROS_SOURCE_TOPIC"); fi
+
+# **ros 模式必须 source ROS 环境。** rclpy / sensor_msgs 在
+# /opt/ros/humble/lib/python3.x/site-packages 里，不 source 就是 ImportError，
+# 而那条报错看起来像"没装 ROS"。这里替调用者 source，和服务脚本无关。
+#
+# **也必须用 python3 -s。** 板子的系统 numpy 是 1.21.5，用户目录里还装着一个
+# numpy 2.x，默认会盖住系统版本；ROS 模式的 camera_node 要 import cv2
+# （python3-opencv 按 1.x 编的），numpy 2.x 会让它直接抛 ABI 报错。
+# -s（或 PYTHONNOUSERSITE=1）不加载用户目录。monitor 模式不加 -s，
+# 保持和以前完全一样。
+PY=(python3)
+if [ "$MODE" = "ros" ]; then
+  if [ -f /opt/ros/humble/setup.bash ]; then
+    # ROS 的 setup.bash 里有裸变量引用（AMENT_TRACE_SETUP_FILES），在
+    # `set -u` 下 source 会报 unbound variable 直接退出 —— 前后临时关掉。
+    set +u
+    # shellcheck disable=SC1091
+    . /opt/ros/humble/setup.bash
+    set -u
+  else
+    echo "找不到 /opt/ros/humble/setup.bash —— ROS 模式需要 ROS 2 Humble" >&2
+    exit 2
+  fi
+  PY=(python3 -s)
+fi
+
+exec "${PY[@]}" src/device_agent.py "${ARGS[@]}" "$@"

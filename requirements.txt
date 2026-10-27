@@ -10,6 +10,20 @@
 #
 # Only the pip-safe part is listed below. The hardware-specific encoder/decoder
 # elements (mpph264enc, mppjpegdec) come from the board vendor's MPP plugins.
+#
+# ROS mode (`--mode ros`, see ros2_ws/) adds a few more system packages, none of
+# them pip-installable:
+#
+#   ros-humble-ros-base                 # rclpy, sensor_msgs, std_msgs, launch_ros
+#   python3-colcon-common-extensions    # colcon build
+#   python3-opencv  python3-numpy       # detector_node 的预处理
+#   rknn-toolkit-lite2                  # NPU（厂商镜像通常自带）
+#
+# And ROS mode must keep the user-site numpy out of the way: the board has a
+# user-site numpy 2.x on top of the system 1.21 that python3-opencv was built
+# against. The agent runs as `python3 -s`, the ROS nodes get PYTHONNOUSERSITE=1
+# (a `ros2 launch` child cannot take `-s`). tools/run-agent.sh and
+# tools/run-ros-nodes.sh do both for you.
 
 aiohttp>=3.8,<4
 

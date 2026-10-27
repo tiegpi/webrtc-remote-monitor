@@ -28,6 +28,7 @@ web_server.py —— 板子侧的观看页服务
     /                      monitor.html
     /config.json           本服务的配置（房间号），页面拿它当默认值
     /camera                →  device_agent（本地 unix socket，切换摄像头）
+    /stats                 →  device_agent（本地 unix socket，会话/ROS 计数）
     /ice.json  /diag       →  信令服务器（原样转发）
     /ws/view               →  信令服务器（WebSocket 双向透传）
     /healthz               本服务自己的存活检查
@@ -291,15 +292,10 @@ async def handle_ws_view(request):
 # --------------------------------------------------------------------------- #
 # 摄像头控制：同源转给 device_agent 的 unix socket
 # --------------------------------------------------------------------------- #
-async def handle_camera(request):
-    """把 /camera 转给 device_agent 的本地控制端点。
+async def _proxy_agent(request, path, what):
+    """把请求原样转给 device_agent 的本地 unix socket。
 
-    **为什么让板子中转、而不让页面直连 device_agent**：页面是 https 来的，
-    直连会同时踩上这个文件开头总结的那两个坑 —— 跨源，以及自签证书在
-    fetch() 里静默 reject（没有任何交互能让你"继续前往"）。绕一手之后，
-    浏览器这一侧只剩 web_server 一个来源，和信令那边是同一个思路。
-
-    走 unix socket 对页面完全透明：它只看到同源的 POST /camera。
+    走 unix socket 对页面完全透明：它只看到同源的 POST /camera、GET /stats。
     """
     args = request.app["args"]
     sock = agent_socket_path(args)
@@ -313,7 +309,7 @@ async def handle_camera(request):
             connector=aiohttp.UnixConnector(str(sock))
         ) as local:
             async with local.request(
-                request.method, "http://localhost/camera",
+                request.method, "http://localhost" + path,
                 data=body or None, headers=headers,
             ) as r:
                 payload = await r.read()
@@ -325,9 +321,29 @@ async def handle_camera(request):
     except (aiohttp.ClientError, OSError) as exc:
         # device_agent 没跑（或者 socket 被删了）时给明确的 502。
         # 页面那边会把这句打到日志区 —— 比一个空 200 好得多。
-        log.warning("转发 /camera 失败（%s）: %s", sock, exc)
+        log.warning("转发 %s（%s）失败（%s）: %s", path, what, sock, exc)
         raise web.HTTPBadGateway(
             text="连不上推送端（%s）。device_agent.py 起了吗？" % sock)
+
+
+async def handle_camera(request):
+    """把 /camera 转给 device_agent 的本地控制端点。
+
+    **为什么让板子中转、而不让页面直连 device_agent**：页面是 https 来的，
+    直连会同时踩上这个文件开头总结的那两个坑 —— 跨源，以及自签证书在
+    fetch() 里静默 reject（没有任何交互能让你"继续前往"）。绕一手之后，
+    浏览器这一侧只剩 web_server 一个来源，和信令那边是同一个思路。
+    """
+    return await _proxy_agent(request, "/camera", "切换摄像头")
+
+
+async def handle_stats(request):
+    """把 /stats 转给 device_agent。
+
+    只读端点，给 tools/check_ros_mode.sh 用：浏览器那边看动画，脚本这边看
+    ros_frames / ros_persons 有没有涨。两者是独立证据，不需要人盯着页面。
+    """
+    return await _proxy_agent(request, "/stats", "会话统计")
 
 
 # --------------------------------------------------------------------------- #
@@ -357,6 +373,7 @@ def build_app(args):
     # 必须在最后那条 /{path:.*} 兜底路由**之前**注册，否则会被它当静态文件吃掉。
     app.router.add_get("/config.json", handle_config)
     app.router.add_route("*", "/camera", handle_camera)
+    app.router.add_get("/stats", handle_stats)
     app.router.add_route("*", "/ws/view", handle_ws_view)
     for p in PROXY_PATHS:
         app.router.add_route("*", p, handle_proxy)
@@ -418,6 +435,7 @@ def main(argv=None):
                     "多半连不上 —— 请在命令行补上，值要和 device_agent.py 的一致")
     log.info("  媒体不经过本服务，是浏览器和板子之间直连的")
     log.info("  摄像头切换  : POST /camera → %s", agent_socket_path(args))
+    log.info("  会话统计    : GET /stats   → %s", agent_socket_path(args))
     if args.tls_cert:
         log.info("  浏览器第一次打开会拦自签证书，点一次「继续前往 / 接受风险」即可")
 

@@ -19,3 +19,12 @@ __pycache__/
 # device_agent 的本地控制端点（unix socket，页面切换摄像头用）。
 # 相对路径按项目根算，见 device_agent.socket_path()。
 run/
+
+# colcon 的产物。ros2_ws/src/ 是源码，要进仓库；这三样都是生成物，
+# 换台板子 tools/build-ros-ws.sh 重编一次就有了。
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# 模型文件（几十 MB，且各人有各人的来源）。用 launch 参数 model:= 指过去。
+*.rknn

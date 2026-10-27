@@ -184,6 +184,13 @@ src/
   signal_server.py  信令服务器（局域网跑在板子上，公网跑在 VPS 上，同一个文件）
   sdpview.py        把 SDP 读成人话（板子和工具共用）
   teleop.py         遥操作协议：白名单、校验、ACK/NACK、叠加文案（纯标准库）
+  ros_mode.py       ROS 模式的 agent 侧：订阅标注图推进 appsrc、发切源请求、读检测统计
+
+ros2_ws/src/webrtc_detect/
+  camera_node.py    采集节点：摄像头 → /camera/image_raw，管 /camera/select、/camera/source
+  detector_node.py  推理节点：/camera/image_raw → 画框 → /detect/image_annotated + /detect/persons
+  detector_core.py  两边共用的纯函数：letterbox、anchor 解码、NMS、画框、白平衡、RKNN 上下文
+  launch/           起两个节点的 launch 文件（负责把仓库 src/ 放上 PYTHONPATH）
 
 web/
   monitor.html      整个观看页：一个文件，没有构建步骤
@@ -199,6 +206,10 @@ tools/
   check_fd.sh                 会话拆除后设备 fd 有没有还回去
   check_teleop.py             遥操作协议单测（宿主机，无 GStreamer）
   check_textoverlay.py        textoverlay 三种采集组合的帧率实测（板子）
+  build-ros-ws.sh run-ros-nodes.sh
+                              ROS 模式：编工作空间 / 起 camera_node + detector_node
+  check_ros_mode.py            ROS 模式单测（宿主机，35 条，不需要 ROS/GStreamer/NPU）
+  check_ros_mode.sh            ROS 模式整链路判据（板子，读 agent 的 /stats）
   check_audio.sh check_offer.py selftest.py turn_check.py freeze_stats.py …
                              单项排查工具
 ```
@@ -253,6 +264,74 @@ MIPI（OV13850）在**这块板子上**是弱势的一方，因为板子上**没
 **这解释了一个不对称**：切到 USB 是一步到位，切回 MIPI 有几秒画面在爬
 （曝光闭环 + 白平衡前 15 帧要重跑）。而且顺序必须"先设曝光、再自校准" ——
 校准帧曝光不对，算出的增益就是错的。
+
+### ROS 模式：三个进程，话题做边界
+
+`--mode ros` 换掉的只有**视频前端**。WebRTC 那一层（信令、ICE、音频回程、会话、
+遥操作之外的遥测）和 monitor 模式完全同源，因为 `build_ros()` 直接复用
+`pipeline.apply_ice / video_tail / audio_branch / encoder_desc`：
+
+```
+camera_node ──/camera/image_raw──> detector_node ──/detect/image_annotated──┐
+    │                                  │                                     │
+    │ /camera/source（latched）         │ /detect/persons（JSON）              │
+    └── /camera/select                 └─────────────────────────────────────┘
+                                                                             ▼
+                                          device_agent --mode ros
+                                          RosLink  ：一个长驻 rclpy 节点 + spin 线程
+                                          RosBridge：每观看端一个图像订阅 → appsrc
+                                            → videoconvert → mpph264enc
+                                            → rtph264pay → webrtcbin
+```
+
+拆开的好处，和"为什么不把推理也放进 agent"是同一个答案：**检测结果要对别的节点可用**，
+而检测坏了也不该把预览一起拖死。三个具体的设计取舍：
+
+- **推理在 `detector_node` 的单独线程里**，不是订阅回调里。RKNN 一次 20~30 ms，放在
+  回调里会把 executor 堵住，之后所有话题回调（包括切源回报）跟着排队。
+- **每一帧都发标注图，推理限频**（默认 5 fps，视频 30 fps）。中间帧复用上一次的框，
+  代价是框最多晚 1/detect_fps 秒 —— 预览要的是流畅，检测要的是准。
+- **`rclpy.shutdown()` 只在进程退出时调一次**。它是进程级的；跟着会话建/拆的后果是
+  下一个观看端接入时 rclpy 已经死了，而报错会出现在一个和"上一个观看端离开"看起来
+  毫无关系的地方。
+
+切源在这个模式下**不是本地动作**：摄像头属于 `camera_node`，agent 只发一条
+`/camera/select`，然后等 `/camera/source` 的回报（最多 8 秒，等的是"新设备发出第一帧"）。
+HTTP 的 `applied` 就直接等于"有没有等到这条回报"。
+
+管道骨架和 monitor 模式几乎一样，只有两处不同：帧来自话题（因为帧没有 v4l2 的 pts，
+`appsrc` 用 `do-timestamp=true` 按到达时刻打点），并且**没有 `textoverlay`** ——
+总线上的画面是共享的，画框由 `detector_node` 做，命令文字不该由某一个消费者单方面烧进去。
+
+**分辨率是两边写死的约定**：`appsrc` 的 caps 在描述串里固定，和话题上的尺寸对不上时
+每一帧都会被丢掉，`ros2 topic hz` 照样是 30 Hz，浏览器全黑。`RosBridge` 因此显式检查
+尺寸并把**每一帧**都记进 `ros_errors`（日志按 3/100 节流，但计数不能节流，否则
+"一直不对"会显示成"偶发错误"）。
+
+**三个只在这块板子上才会现形、而且都不报错的坑**（都在板子上实测踩过，单测各有一条）：
+
+- **`bytes` 不能直接赋给 `sensor_msgs/Image.data`。** 这个版本的 rclpy 会**逐元素**
+  转换 `uint8[]`：720p 一帧 439 ms —— 一秒钟两帧，而且是在发布线程里同步花掉的，
+  采集线程/订阅回调被一起拖住。现场表现是"话题里几乎没有数据、日志一条错误都没有"。
+  换成 `array('B')` 是 0.3 ms（`detector_core.as_uint8_array`）。
+- **`GstApp` 必须在 `parse_launch` 之前 import。** PyGObject 按类型缓存包装对象，
+  晚了拿到的 `rossrc` 是个没有 `push_buffer` 的秃 `GstAppSrc`：每来一帧抛一次
+  `AttributeError`、被 spin 线程的 `except` 兜走，`/stats` 上 `ros_frames` 和
+  `ros_errors` **都是 0**，看起来像话题根本没通。
+- **这块板子的 `mppjpegdec` 解 USB 的 720p MJPG 慢到 ≈1.5 秒/帧，且不报错。**
+  同一个设备 `v4l2src` 直出有 16 fps、`jpegdec` 也是 16 fps。所以 `camera_node`
+  的 `camera_decoder` 默认 `sw`（软件解码，约一个核），确认 MPP 正常的板子可以用
+  `camera_decoder:=mpp` 把那个核省回来。monitor 模式仍然走 `mppjpegdec`。
+
+日志本身也有一个坑：`RcutilsLogger` **不是** `logging.Logger`，不吃 %-占位符 +
+位置参数（多传一个就是 `TypeError`）。所以两个节点里所有 `get_logger()` 都先自己
+`%` 格式化好再传一个字符串，`tools/check_ros_mode.py` 用 AST 静态扫一遍防回归。
+
+还有一个只在 ROS 模式才会现形的行为差异：`rclpy.init()` 会把 SIGTERM 的默认动作
+（终止进程）**换成"关掉 context"**，进程自己不退 —— 板子上实测 `service.sh stop`
+发完 TERM 之后 20 秒还活着，只能吃 10 秒后那一发 SIGKILL。`device_agent.main()`
+在 `rclpy.init()` 之后装了自己的处理器，把 TERM 变成和 Ctrl-C 一样的
+`KeyboardInterrupt`（实测 413 ms 退出），两种模式走同一条收尾路径。
 
 ---
 
@@ -393,7 +472,11 @@ VPS 上跑着同样的 `web_server.py`，但它没有 `device_agent` 的本地 u
 ┌─ 主线程 ──────────── asyncio 事件循环，跑 WebSocket 收发
 │                        on_signal() 在这里被调用
 │
-└─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+├─ glib-main 线程 ──── GLib.MainLoop，GStreamer 的回调都在这里
+│
+└─ ros-spin 线程 ───── ROS 模式才有：一个长驻 rclpy 节点，
+                         跑 SingleThreadedExecutor.spin_once(0.2)
+                         （图像回调、/camera/source、/detect/persons 都在这里）
 ```
 
 GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能在 asyncio 线程里写。
@@ -403,9 +486,16 @@ GStreamer 的信号回调**只能**在 GLib 线程里跑，而 WebSocket 只能�
 |---|---|
 | asyncio → GLib | `on_signal()` 里 emit webrtcbin 的信号，会同步派发到 GLib 线程 |
 | GLib → asyncio | `_send_threadsafe()` 用 `run_coroutine_threadsafe` 投回去 |
+| asyncio → ros-spin | 切源发布 `/camera/select`；等回报用 `run_in_executor`（`wait_source` 是阻塞轮询） |
+| ros-spin → GStreamer | `appsrc.push_buffer()` —— 唯一一个跨线程碰 GStreamer 的地方，它本身线程安全 |
 
 不要在别的任何地方跨线程碰对方的对象。切摄像头是第三个例子：它只能在 GLib 线程
 调用，所以 HTTP 端点用 `GLib.idle_add` 投递、用 `loop.call_soon_threadsafe` 回填结果。
+
+ros-spin 线程上有两条纪律：**回调里不做耗时的事**（这个线程还负责切源回报和检测统计），
+以及**订阅的建/拆可以在别的线程发起**（rclpy 的 executor 每个等待周期都会重新收集节点
+上的实体，`create_subscription` / `destroy_subscription` 之后会唤醒它），但
+`rclpy.shutdown()` 是进程级的，只能在整个 agent 退出时调一次。
 
 **单观看端**：本项目按遥操作场景设计，同一时刻只允许一个观看端，所以代码里没有
 viewer id 那套东西。第二个观看端会被回"本设备同时只接受一个观看端"。
@@ -499,6 +589,13 @@ tools/check_switch.sh --base https://<板子>:8443
 
 # 会话拆除后设备 fd 有没有还回去（**在板子上跑**，它要读本机 /proc）
 tools/check_fd.sh --cycles 3
+
+# ROS 模式单测：35 条（宿主机，不需要 ROS/GStreamer/NPU）
+python3 tools/check_ros_mode.py
+
+# ROS 模式整链路：读 agent 的 /stats，判 ros_frames 和 video_packets_out 同时在涨
+# （板子上跑；节点和 agent 要先起来，并且有观看端在看）
+tools/check_ros_mode.sh --switch-to usb
 ```
 
 **`--audio` 默认不开**：它要人手在页面上点「开始对讲」才会起麦克风，没点的时候
@@ -559,6 +656,18 @@ python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080
 
 只跑 `signal_server.py` 也能出画面（它自己在 `/` 提供页面），但没有 `/camera`
 代理，页面上不会出现切换摄像头的按钮。
+
+### ROS 模式（LAN 形态同理，只是推流端换一个参数）
+
+```bash
+tools/build-ros-ws.sh                    # colcon build --symlink-install，编一次就行
+tools/run-ros-nodes.sh                   # camera_node + detector_node
+MODE=ros tools/service.sh restart agent  # 或 python3 -s src/device_agent.py --mode ros ...
+```
+
+三个进程的启动顺序无所谓。ROS 模式的两个环境前提（`source /opt/ros/humble/setup.bash`
+和 `python3 -s`）由 `run-agent.sh` / `run-ros-nodes.sh` 负责，手工起 agent 时别忘了。
+`--width/--height` 要和 launch 参数一致，见第四节「ROS 模式」。
 
 ### 公网（当前部署形态）
 

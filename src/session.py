@@ -6,6 +6,10 @@ session.py —— 一路 WebRTC 会话：pipeline + webrtcbin + 信令
 一个观看端 = 一个 DeviceSession。本项目按遥操作场景设计，**同时只允许一个**，
 所以这里没有 viewer id 那套东西（见 docs/architecture.md 的取舍说明）。
 
+WebRTC 这一层对三种运行模式（monitor / ros）是同一份代码：差异全部落在
+pipeline.build() 返回的 switch 实现上（VideoSwitch 或 ros_mode.RosSwitch）。
+本文件只需要知道两件事 —— ROS 模式没有 textoverlay、也不建 DataChannel。
+
 线程模型是这块最容易踩的地方，先讲清楚：
 
     ┌─ 主线程 ──────────── asyncio 事件循环，跑 WebSocket 收发
@@ -271,6 +275,9 @@ class DeviceSession:
 
         不重新协商、不重建 PeerConnection、不碰音频 —— 换的只有采集那一段，
         编码输出仍是同一份 caps。返回最终生效的源名。
+
+        ROS 模式下这个名字只是"请求已经发出去"，设备侧要到 camera_node 的
+        /camera/source 回报才算数；那条路在 device_agent.handle_camera 里等。
         """
         if self.switch is None:
             # 还没有会话（没有观看端）时只记住选择，等建 pipeline 时用它。
@@ -386,12 +393,30 @@ class DeviceSession:
             self.n_audio_frames_decoded += 1
         return Gst.PadProbeReturn.OK
 
+    def _ros(self):
+        """本会话是不是 ROS 模式。工具脚本可能不带 --mode，缺省按 monitor。"""
+        return getattr(self.args, "mode", "monitor") == "ros"
+
     def counters(self):
         """给遥测用的快照。
 
         video_source / video_switches 是"板子真的换了那一段"的设备侧判据 ——
         浏览器那边的画面变化可以被很多原因解释，这两个数是直接证据。
+
+        ROS 模式另外并进一组 ros_*：话题、推给 appsrc 的帧数、camera_node
+        回报的源、检测节点报的"几个人 / 多少毫秒"。这些是**设备侧**的账，
+        和浏览器里"看着有几帧"是两回事。
         """
+        out = self._counters()
+        mode = getattr(self.args, "mode", "monitor")
+        out["mode"] = mode
+        if mode == "ros" and self.switch is not None:
+            ros = getattr(self.switch, "ros_counters", None)
+            if ros is not None:
+                out.update(ros())
+        return out
+
+    def _counters(self):
         return {
             "video_packets_out": self.n_packets_out,
             "video_bytes_out": self.n_bytes_out,
@@ -474,10 +499,15 @@ class DeviceSession:
             return
         self._negotiating = True
 
+        # ROS 模式不建 DataChannel：画面由 ROS 节点负责（框已经烧进去），
+        # 命令台在页面那一侧也整块藏起来了。建了反而会多一路页面永远不用的
+        # 协商内容，而页面按"单次协商"设计，多出来的东西只会增加困惑。
+        if self._ros():
+            log.info("ROS 模式不建 DataChannel（遥操作命令台不启用）")
         # **DataChannel 必须在 create-offer 之前建**，否则不会写进这份 SDP。
         # 这一步能走到就说明 pipeline 已经 PLAYING 了 —— 更早调用时
         # create-data-channel 会静默返回 None（只在日志里留一行 assertion）。
-        if self.dc is None:
+        elif self.dc is None:
             try:
                 self.dc = element.emit("create-data-channel", "teleop", None)
             except Exception:                # noqa: BLE001
@@ -523,7 +553,12 @@ class DeviceSession:
         self.overlay = (self.pipeline.get_by_name("teleop")
                         if self.pipeline is not None else None)
         if self.pipeline is not None and self.overlay is None:
-            log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
+            if self._ros():
+                # ROS 模式的骨架里本来就没有叠加层（没有 DataChannel，命令台
+                # 不启用）。这不是错误，但也不该悄悄过去。
+                log.info("ROS 模式没有 teleop 叠加层：画面由 ROS 节点负责")
+            else:
+                log.error("管线里找不到 teleop 叠加层 —— 命令会 ACK，但画面上没有字")
 
     def _dc_state(self):
         if self.dc is None:

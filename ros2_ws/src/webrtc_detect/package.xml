@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>webrtc_detect</name>
+  <version>0.1.0</version>
+  <description>
+    camera_node + detector_node：图像走 ROS 2 话题总线，OpenCV 预处理、RKNN 推理
+    各是一个普通 ROS 节点，WebRTC 那一端（src/device_agent.py --mode ros）
+    只订阅 /detect/image_annotated 推流。
+  </description>
+  <maintainer email="tieg77@163.com">Ge Tie</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

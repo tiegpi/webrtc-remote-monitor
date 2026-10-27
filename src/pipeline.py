@@ -144,6 +144,23 @@ def video_tail(a):
     ).format(pt=PT_VIDEO)
 
 
+def encoder_desc(a):
+    """硬件 H.264 编码器的参数串。**所有模式共用这一份。**
+
+    profile/level 必须显式写。mpph264enc 默认给的是 High profile
+    (profile-level-id=640028)，浏览器多半直接拒收；写成 baseline+31
+    得到 42c01f（Constrained Baseline 3.1），Chrome/Firefox 都认。
+
+    别想着改用 capsfilter `video/x-h264,profile=baseline` 去设 ——
+    那样反而会把整个 fmtp 行去掉，浏览器连 profile 都读不到，更糟。
+
+    gop：关键帧间隔。这个值不能省，因为 config-interval=-1 只在**确实有
+    关键帧**时才有用，否则中途加入的浏览器永远等不到 SPS/PPS，表现是一直黑屏。
+    """
+    return ("mpph264enc profile=baseline level=31 gop={gop} bps={bps} rc-mode=cbr"
+            .format(gop=a.gop, bps=a.bitrate))
+
+
 def segment_desc(a, src):
     """可替换的**采集段**：v4l2src → 硬件 H.264 → h264parse。
 
@@ -177,19 +194,9 @@ def segment_desc(a, src):
         "textoverlay name=teleop wait-text=false silent=false auto-resize=false "
         "font-desc=\"DejaVu Sans 20\" halignment=left valignment=top "
         "shaded-background=true deltax=16 deltay=12 ! "
-        #
-        # profile/level 必须显式写。mpph264enc 默认给的是 High profile
-        # (profile-level-id=640028)，浏览器多半直接拒收；写成 baseline+31
-        # 得到 42c01f（Constrained Baseline 3.1），Chrome/Firefox 都认。
-        #
-        # 别想着改用 capsfilter `video/x-h264,profile=baseline` 去设 ——
-        # 那样反而会把整个 fmtp 行去掉，浏览器连 profile 都读不到，更糟。
-        #
-        # gop：关键帧间隔。这个值不能省，因为 config-interval=-1 只在**确实有
-        # 关键帧**时才有用，否则中途加入的浏览器永远等不到 SPS/PPS，表现是一直黑屏。
-        "mpph264enc profile=baseline level=31 gop={gop} bps={bps} rc-mode=cbr ! "
+        + encoder_desc(a) + " ! "
         "h264parse name=vtail"
-    ).format(gop=a.gop, bps=a.bitrate)
+    )
 
     if src.kind != "raw" or not getattr(a, "camera_wb", None):
         return head + tail
@@ -718,7 +725,15 @@ def build(a, ice, log, source, on_audio_elements=None):
 
     on_audio_elements 在**回程链建出来之后**被调用（参数是 {名字: 元素}），
     给 session.py 挂统计探针用。回程链是运行期才建的，所以只能回调，不能返回。
+
+    `--mode ros` 时视频前端换成 ROS 话题（见 ros_mode.py）：本文件里采集段
+    换成了 appsrc，骨架、ICE、音频回程、RTP 尾段仍是同一份。分支放在最前面，
+    monitor 模式一个元素都没变。
     """
+    if getattr(a, "mode", "monitor") == "ros":
+        import ros_mode
+        return ros_mode.build_ros(a, ice, log, source, on_audio_elements)
+
     from gi.repository import Gst
 
     pipeline = Gst.parse_launch(skeleton_desc(a))

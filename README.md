@@ -52,6 +52,10 @@ an explicit "device busy" status instead of kicking the first viewer off.
   the control path and the media path in one glance.
 - **LAN and public deployment from the same code** — a single `signal_server.py` runs
   on the board for LAN-only mode or on a VPS with coturn for WAN access.
+- **Optional ROS 2 mode** — `--mode ros` publishes the image over the ROS topic bus:
+  capture and inference are ordinary ROS nodes, detection results are available to any
+  subscriber, and WebRTC only pushes the annotated topic to the browser. See
+  [ROS 2 mode](#ros-2-mode-the-picture-rides-the-topic-bus).
 
 ## Architecture
 
@@ -133,6 +137,126 @@ that *look* like success:
 | Board-side `teleop_overlay` tracks ACKs | A truthful ACK over a dead video path |
 | Board-side `teleop_rx` matches page-side `sent` | The page grading its own homework |
 
+## ROS 2 mode: the picture rides the topic bus
+
+`--mode ros` wires the same WebRTC stack to ROS 2 topics: capture and inference each
+become an ordinary ROS node, and the publisher degrades into "subscribe to the
+annotated image, encode, send". The point is to keep detection results usable by other
+nodes (planning, control) instead of trapping them inside the streaming process.
+
+```
+camera_node ──/camera/image_raw──> detector_node ──/detect/image_annotated──┐
+    │                                  │                                     │
+    │ /camera/source (latched)         │ /detect/persons (JSON)              │
+    └── /camera/select                 └─────────────────────────────────────┘
+                                                                             ▼
+                                                    device_agent --mode ros
+                                                    RosLink  : switches, reports, stats
+                                                    RosBridge: annotated image → appsrc
+                                                      → videoconvert → mpph264enc
+                                                      → rtph264pay → webrtcbin
+```
+
+Three processes, topics as the only coupling:
+
+| Topic | Type | Direction | Contents |
+|---|---|---|---|
+| `/camera/image_raw` | `sensor_msgs/Image` (`bgr8`) | camera_node → detector_node | raw 720p frame |
+| `/detect/image_annotated` | `sensor_msgs/Image` (`bgr8`) | detector_node → agent | boxes already drawn in |
+| `/detect/persons` | `std_msgs/String` (JSON) | detector_node → anyone | boxes, scores, inference time |
+| `/camera/select` | `std_msgs/String` | agent → camera_node | ask for a different camera |
+| `/camera/source` | `std_msgs/String` (latched) | camera_node → agent | which camera is **actually** open |
+
+Detection results are JSON in a `std_msgs/String` rather than a custom message: the
+board has no internet access, a rosidl custom type needs its own colcon package, and a
+planning node only needs `json.loads`.
+
+```json
+{"count": 1, "inference_ms": 23.4,
+ "stamp": {"sec": 1793021234, "nanosec": 512000000},
+ "frame": {"height": 720, "width": 1280},
+ "boxes": [{"label": "person", "score": 0.87, "x1": 512, "y1": 96, "x2": 704, "y2": 611}]}
+```
+
+### Running it
+
+```bash
+tools/build-ros-ws.sh            # colcon build --symlink-install
+tools/run-ros-nodes.sh           # camera_node + detector_node (foreground)
+MODE=ros tools/service.sh restart agent     # subscribes to /detect/image_annotated
+```
+
+Order does not matter: with no nodes running the agent simply has no picture yet. To
+run at another resolution, pass it to both sides:
+
+```bash
+tools/run-ros-nodes.sh width:=640 height:=480   # and --width/--height on the agent
+```
+
+**The resolution is a contract between the two processes.** `appsrc` caps are fixed, so
+a size mismatch drops every frame — `ros2 topic hz` shows 30 Hz while the browser stays
+black and `/stats`'s `ros_errors` climbs. That is the first criterion in
+`tools/check_ros_mode.sh`.
+
+### Why three processes
+
+- **A broken detector does not take the preview down.** If the model or the NPU is
+  unavailable, `detector_node` still forwards the raw frame as the annotated topic — just
+  without boxes — so debugging does not chase the wrong layer.
+- **Restarting a node does not restart the session.** Signaling, ICE and audio live in
+  the agent; restarting `camera_node` freezes the picture for a few seconds, nothing more.
+- **Subscriptions are created per viewer.** With nobody watching, no 720p frame is
+  copied at all; camera switching and detection stats keep working without a session.
+
+### Switching cameras is not local in this mode either
+
+The camera belongs to `camera_node`. The page asks the agent, the agent publishes
+`/camera/select`, and `camera_node` reports `/camera/source` only after it has reopened
+the device, run the brightness loop and **produced a first frame** (8 s budget).
+`applied` in the HTTP reply means "that report arrived" — publishing a message always
+succeeds, only the device side counts.
+
+### Differences from monitor mode
+
+| | monitor (default) | ros |
+|---|---|---|
+| Capture / inference | in-process | `camera_node` / `detector_node` |
+| Boxes | `textoverlay` burned into H.264 | drawn by `detector_node` with OpenCV |
+| Teleop console | yes (DataChannel + on-screen text) | **no** (a shared bus picture should not be annotated by one consumer) |
+| Camera switch | replace the capture segment | publish a request, device reopens |
+| Signaling / ICE / audio return / sessions | identical code | identical code |
+
+### Verification
+
+```bash
+python3 tools/check_ros_mode.py                    # host: 35 checks, no ROS/GStreamer/NPU
+bash tools/check_ros_mode.sh --switch-to usb       # board: reads the agent's /stats
+```
+
+Board-side criteria are device-side facts: `ros_frames` (topic → appsrc),
+`video_packets_out` (RTP actually sent), `ros_errors` (must be 0), `ros_source` (what
+`camera_node` reported). Either one alone can lie — frames climbing with RTP flat means
+the encoder/webrtcbin is stuck, RTP climbing with frames flat means the picture froze
+long ago.
+
+### Caveats
+
+- **Bandwidth**: 1280×720 `bgr8` is ~**55 MB/s**. Fine over loopback; over a real network
+  subscribe to `/detect/persons` instead of the image.
+- **USB (MJPG) decodes in software by default.** On this board `mppjpegdec` takes about
+  1.5 s per 720p MJPG frame and reports no error at all (`v4l2src` alone does 16 fps and
+  `jpegdec` also does 16 fps). So `camera_node` defaults to `camera_decoder=sw`, roughly
+  one core; on a board where MPP behaves,
+  `tools/run-ros-nodes.sh camera_decoder:=mpp` buys that core back. MIPI (raw) is
+  unaffected.
+- **The model is not in the repo** (`.rknn` is gitignored). Point at it with `model:=...`.
+- **ROS mode needs `/opt/ros/humble/setup.bash` and the user-site numpy out of the way**:
+  the board's system numpy is 1.21 (what `python3-opencv` was built against) and a
+  user-site numpy 2.x breaks `import cv2` with an ABI error. The agent runs under
+  `python3 -s`; the nodes get `PYTHONNOUSERSITE=1` (a `ros2 launch` child cannot take
+  `-s`). `tools/run-agent.sh` and `tools/run-ros-nodes.sh` handle both.
+- **One viewer** stays a design constraint, in both modes.
+
 ## Measured results
 
 | Metric | Value | Notes |
@@ -160,6 +284,17 @@ sudo apt install python3-gi python3-aiohttp python3-numpy \
 ```
 
 `numpy` is only needed for `--camera-wb`; see [requirements.txt](requirements.txt).
+
+ROS 2 mode (`--mode ros`) additionally needs these (apt / vendor image, not pip):
+
+```bash
+sudo apt install ros-humble-ros-base python3-colcon-common-extensions \
+    python3-opencv python3-numpy
+# rknn-toolkit-lite2 ships with the board vendor image; the .rknn model is not in the repo
+```
+
+ROS mode has to source `/opt/ros/humble/setup.bash` and run under `python3 -s`;
+`tools/run-agent.sh` and `tools/run-ros-nodes.sh` take care of both.
 
 ### LAN only (no VPS)
 
@@ -354,6 +489,7 @@ routing, and why `/ws/publish` deliberately stays outside Basic Auth.
 
 | Flag | Why it exists |
 |---|---|
+| `--mode ros` | Publish over ROS 2 topics instead of capturing in-process. Default `monitor` |
 | `--gop 10` | Camera switch waits at most one IDR; `60` breaks the freeze-ratio criterion |
 | `--camera-wb auto` | Gray-world AWB when the board has no 3A. Calibrate against a neutral surface |
 | `--camera-ctl analogue_gain=176,exposure=1648` | Write sensor controls directly, no closed loop |
@@ -382,6 +518,12 @@ python3 tools/test_signal_server.py
 
 # Headless peer: real offer/answer, audio and DataChannel, no browser
 python3 tools/selftest.py --signal https://<vps> --room <room> --duration 20
+
+# ROS mode unit checks: 30 of them, host only, no ROS / GStreamer / NPU
+python3 tools/check_ros_mode.py
+
+# ROS mode end to end (on the board, with nodes + agent running and a viewer attached)
+bash tools/check_ros_mode.sh --switch-to usb
 ```
 
 Diagnostics are collected rather than asserted: the page posts 1 Hz `getStats()`
@@ -416,24 +558,30 @@ src/
   device_agent.py    publisher: signaling, session lifecycle, telemetry, local control socket
   session.py         one WebRTC session: pipeline + webrtcbin + DataChannel + signaling
   pipeline.py        GStreamer graph: permanent skeleton + replaceable capture segment
+  ros_mode.py        ROS mode, agent side: annotated image → appsrc, switches, stats
   sources.py         camera table: device node, native format, quality fallback
   camera.py          brightness closed loop (no AE on the board)
   whitebalance.py    gray-world AWB bridge (no AWB on the board)
   audio.py           ALSA device discovery and level probe
   signal_server.py   signaling + /ice.json + diagnostics (LAN or VPS, same file)
-  web_server.py      page server + same-origin proxy (/ws/view, /ice.json, /diag, /camera)
+  web_server.py      page server + same-origin proxy (/ws/view, /ice.json, /diag, /camera, /stats)
   teleop.py          command protocol: whitelist, validation, ACK/NACK, overlay text
   sdpview.py         SDP → human-readable media sections (shared by tools)
+ros2_ws/
+  src/webrtc_detect/ ROS 2 package: camera_node, detector_node, detector_core, launch/
 web/
   monitor.html       the whole viewer UI: one file, no build step
 tools/
   service.sh        board services: start / stop / restart / status / logs
   service_vps.sh    manage the VPS systemd units from the dev machine
   run-agent.sh run-web.sh  foreground start (debugging)
+  build-ros-ws.sh   colcon build --symlink-install
+  run-ros-nodes.sh  start camera_node + detector_node (the ROS half of the system)
   deploy_vps.sh     VPS: signaling + coturn
   deploy_web_vps.sh VPS: page service + nginx routes
   gen_cert.sh       board self-signed certificate
   analyze_diag.py   main acceptance criteria
+  check_ros_mode.py / check_ros_mode.sh  ROS mode unit checks / end-to-end criteria
 docs/architecture.md  the deep dive: topology, threads, and every silent failure
 ```
 
@@ -457,6 +605,11 @@ docs/architecture.md  the deep dive: topology, threads, and every silent failure
   (a few hundred KB per session). See `docs/architecture.md §11`.
 - **MIPI quality is sensor-bound.** The loop can only reach Y≈78 in a dim room; more
   light or a different sensor is the only real fix.
+- **ROS mode couples the resolution by hand.** What `camera_node` publishes must equal
+  the agent's `--width/--height`; nothing follows automatically, and a mismatch shows up
+  as "topics have frames, the browser is black".
+- **ROS mode has no teleop console.** The bus picture is shared, so burning command text
+  into it is not one subscriber's call; that belongs on the page side.
 
 ## License
 
