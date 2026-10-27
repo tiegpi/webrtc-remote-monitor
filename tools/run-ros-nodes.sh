@@ -6,9 +6,10 @@
 #     tools/run-ros-nodes.sh detect_fps:=10.0 width:=640 height:=480
 #     CAMERA_SOURCE=mipi tools/run-ros-nodes.sh
 #
-# 另一半是 WebRTC 推流端，单独起：
+# 另一半是 WebRTC 推流端。**平时不用管它**：.env 里写了 MODE=ros 之后
+# `tools/service.sh restart` 会把 nodes 和 agent 一起管；单独起推流端是：
 #
-#     MODE=ros tools/service.sh restart agent
+#     tools/service.sh restart agent
 #     # 或前台：MODE=ros tools/run-agent.sh
 #
 # 两边是**独立进程**，先后顺序不重要（推流端订阅 /detect/image_annotated，

@@ -182,15 +182,30 @@ planning node only needs `json.loads`.
 
 ```bash
 tools/build-ros-ws.sh            # colcon build --symlink-install
-tools/run-ros-nodes.sh           # camera_node + detector_node (foreground)
-MODE=ros tools/service.sh restart agent     # subscribes to /detect/image_annotated
+MODE=ros tools/service.sh restart   # nodes + web + agent in one go
+```
+
+Put `MODE=ros` in `.env` and the prefix goes away: `tools/service.sh restart`,
+`stop` and `status` then manage all three. What `all` means depends on the mode:
+
+| mode | `service.sh start/stop/restart all` |
+|---|---|
+| `monitor` (default) | `web` + `agent` |
+| `ros` | `nodes` (camera_node + detector_node) + `web` + `agent` |
+
+Target the nodes alone (extra arguments are passed through to `ros2 launch`):
+
+```bash
+tools/service.sh restart nodes
+tools/service.sh restart nodes camera_source:=usb width:=640 height:=480
+tools/service.sh logs nodes -f
 ```
 
 Order does not matter: with no nodes running the agent simply has no picture yet. To
 run at another resolution, pass it to both sides:
 
 ```bash
-tools/run-ros-nodes.sh width:=640 height:=480   # and --width/--height on the agent
+tools/service.sh restart nodes width:=640 height:=480   # and --width/--height on the agent
 ```
 
 **The resolution is a contract between the two processes.** `appsrc` caps are fixed, so
@@ -436,8 +451,8 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDI
 #### 4. Start / stop (board)
 
 ```bash
-tools/service.sh start          # web + agent; returns only when both are usable
-tools/service.sh status
+tools/service.sh start          # everything the current mode needs; returns when usable
+tools/service.sh status         # mode, processes, health check, last log line
 tools/service.sh logs agent -f
 tools/service.sh restart
 tools/service.sh stop
@@ -445,7 +460,17 @@ tools/service.sh stop
 
 Processes run in their own session (ssh disconnect does not kill them); pids live in
 `run/*.pid` and logs in `run/*.log` (both gitignored). Target one service with
-`web` / `agent`, e.g. `tools/service.sh restart agent`.
+`web` / `agent`; ROS mode adds `nodes`:
+
+```bash
+tools/service.sh restart agent
+MODE=ros tools/service.sh restart nodes camera_source:=usb
+```
+
+The `nodes` pid is the `ros2 launch` parent. Stopping it sends **SIGINT to the whole
+process group** — `ros2 launch` only forwards SIGINT, while SIGTERM kills the parent and
+leaves both nodes holding the camera — and anything that still survives is swept up by
+command line afterwards.
 
 For foreground debugging, `tools/run-web.sh` and `bash -l tools/run-agent.sh` still
 work; the agent needs `-l` because the BSP exports its GStreamer environment only in

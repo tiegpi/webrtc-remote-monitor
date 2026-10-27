@@ -39,5 +39,5 @@ colcon build --symlink-install "$@"
 
 echo
 echo "完成。接下来："
-echo "  tools/run-ros-nodes.sh                    # 起 camera_node + detector_node"
-echo "  MODE=ros tools/service.sh restart agent   # 起 WebRTC 推流端（订阅标注图）"
+echo "  MODE=ros tools/service.sh restart         # nodes + web + agent 全起"
+echo "  tools/run-ros-nodes.sh                    # 或前台单独起 camera_node + detector_node"

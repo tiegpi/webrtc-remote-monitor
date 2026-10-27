@@ -155,19 +155,37 @@ camera_node ──/camera/image_raw──> detector_node ──/detect/image_ann
  "boxes": [{"label": "person", "score": 0.87, "x1": 512, "y1": 96, "x2": 704, "y2": 611}]}
 ```
 
-### 三步跑起来
+### 两步跑起来
 
 ```bash
-tools/build-ros-ws.sh            # colcon build --symlink-install，改 Python 不用重编
-tools/run-ros-nodes.sh           # camera_node + detector_node（前台）
-MODE=ros tools/service.sh restart agent   # 推流端，订阅 /detect/image_annotated
+tools/build-ros-ws.sh                    # colcon build --symlink-install，改 Python 不用重编
+MODE=ros tools/service.sh restart        # nodes + web + agent 一次全起
 ```
 
-两边顺序无所谓：节点没起时 agent 只是没画面，节点起来就有了。要换分辨率：
+`.env` 里写一行 `MODE=ros` 之后连前缀都可以省掉，`tools/service.sh restart` /
+`stop` / `status` 就按 ROS 模式管三个服务。`all` 具体包含谁由模式决定：
+
+| 模式 | `service.sh start/stop/restart all` |
+|---|---|
+| `monitor`（默认） | `web` + `agent` |
+| `ros` | `nodes`（camera_node + detector_node）+ `web` + `agent` |
+
+单独操作节点、往 launch 里透传参数：
 
 ```bash
-tools/run-ros-nodes.sh width:=640 height:=480   # 同时改 agent 的 --width/--height
+tools/service.sh restart nodes
+tools/service.sh restart nodes camera_source:=usb width:=640 height:=480
+tools/service.sh logs nodes -f
 ```
+
+运行时顺序无所谓：节点没起时 agent 只是没画面，节点起来就有了。要换分辨率：
+
+```bash
+tools/service.sh restart nodes width:=640 height:=480   # 同时改 agent 的 --width/--height
+```
+
+前台调试仍然是 `tools/run-ros-nodes.sh`（它把 ROS 环境、`PYTHONNOUSERSITE`
+都准备好，别自己 source 完再手动跑 python）。
 
 **宽高必须两边一致**。appsrc 的 caps 是写死的，话题上的尺寸对不上会被逐帧丢掉 ——
 `ros2 topic hz` 看着有 30 Hz，浏览器是黑的，`/stats` 里 `ros_errors` 在涨。
@@ -411,22 +429,28 @@ ssh orangepi@<board> 'cd ~/webrtc-remote-monitor && cp .env.example .env && $EDI
 #### 4. 启动 / 停止（板子）
 
 ```bash
-tools/service.sh start          # web + agent，等到真的可用才返回
-tools/service.sh status         # 进程、健康检查、agent 最后一行日志
+tools/service.sh start          # 按模式起全部服务，等到真的可用才返回
+tools/service.sh status         # 模式、各进程、健康检查、最后一行日志
 tools/service.sh logs agent -f
 tools/service.sh restart
 tools/service.sh stop
 ```
 
 进程起在独立会话里，ssh 断开不受影响；pid 在 `run/*.pid`，日志在 `run/*.log`
-（都已 gitignore）。只操作一个服务就加 `web` / `agent`：
+（都已 gitignore）。只操作一个服务就加 `web` / `agent`；ROS 模式还有 `nodes`：
 
 ```bash
 tools/service.sh restart agent
+MODE=ros tools/service.sh restart nodes camera_source:=usb
 ```
 
-前台调试仍然可以直接跑 `tools/run-web.sh` / `bash -l tools/run-agent.sh`；
-agent 必须带 `-l`，因为 BSP 的 GStreamer 环境变量只在登录 shell 里导出。
+`nodes` 的 pid 记的是 `ros2 launch` 父进程；停的时候发的是 **SIGINT 到整个进程组**
+（`ros2 launch` 只认 SIGINT，SIGTERM 会把父进程带走、两个 node 留在原地占着摄像头），
+没跟上来的子进程最后按命令行再收一遍。
+
+前台调试仍然可以直接跑 `tools/run-web.sh` / `bash -l tools/run-agent.sh` /
+`tools/run-ros-nodes.sh`；agent 必须带 `-l`，因为 BSP 的 GStreamer 环境变量只在
+登录 shell 里导出。
 
 #### 5. 日常运维
 

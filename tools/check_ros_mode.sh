@@ -7,8 +7,8 @@
 #     tools/check_ros_mode.sh --base https://192.168.2.187:8443   # 走 web_server
 #
 # 前提：
-#   1. tools/run-ros-nodes.sh 在跑（camera_node + detector_node）；
-#   2. MODE=ros tools/service.sh restart agent 在跑；
+#   1. 节点在跑（tools/service.sh start nodes，或前台 tools/run-ros-nodes.sh）；
+#   2. agent 在跑（.env 里 MODE=ros 时 tools/service.sh start 会一起起）；
 #   3. **有观看端在看页面** —— 没有会话时 agent 不建管线，也就没有 ros_frames
 #      可看。没有浏览器就先用 tools/selftest.py --no-teleop 挂一个无头观看端。
 #
@@ -60,7 +60,7 @@ if [ -n "$BASE" ]; then
     CAM_URL="$BASE/camera"
 else
     [ -S "$SOCK" ] || {
-        echo "找不到控制端点 $SOCK —— agent 起了吗（MODE=ros tools/service.sh start agent）？" >&2
+        echo "找不到控制端点 $SOCK —— agent 起了吗（tools/service.sh start agent）？" >&2
         echo "也可以 --base https://127.0.0.1:8443 走 web_server。" >&2
         exit 2
     }

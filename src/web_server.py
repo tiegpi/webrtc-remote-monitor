@@ -445,8 +445,13 @@ def main(argv=None):
         ssl_ctx.load_cert_chain(args.tls_cert, args.tls_key)
         log.info("已启用 HTTPS（浏览器会需要接受一次自签证书）")
 
+    # shutdown_timeout 必须给：run_app 收到 SIGTERM 后会"优雅"收尾 —— 先不再
+    # 接新连接，然后等正在处理**永远不会自己结束**的请求。这里的 /ws/view 是
+    # 长连代理，观看页开着它就一直在，默认 60 秒等于永远等不到，service.sh
+    # restart 就变成"停 10 秒再 SIGKILL"（板子上实测过）。3 秒足够让遥测 POST
+    # 这类短请求做完，长连接到点被取消即可 —— 反正重启后浏览器会重连。
     web.run_app(build_app(args), host=args.host, port=args.port,
-                ssl_context=ssl_ctx, print=None)
+                ssl_context=ssl_ctx, print=None, shutdown_timeout=3)
     return 0
 
 

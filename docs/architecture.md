@@ -661,12 +661,16 @@ python3 src/web_server.py --port 8443 --room demo --signal http://127.0.0.1:8080
 
 ```bash
 tools/build-ros-ws.sh                    # colcon build --symlink-install，编一次就行
-tools/run-ros-nodes.sh                   # camera_node + detector_node
-MODE=ros tools/service.sh restart agent  # 或 python3 -s src/device_agent.py --mode ros ...
+MODE=ros tools/service.sh restart        # nodes + web + agent 全起
+# 前台调试时也可以拆开：tools/run-ros-nodes.sh、MODE=ros tools/run-agent.sh
 ```
 
-三个进程的启动顺序无所谓。ROS 模式的两个环境前提（`source /opt/ros/humble/setup.bash`
-和 `python3 -s`）由 `run-agent.sh` / `run-ros-nodes.sh` 负责，手工起 agent 时别忘了。
+`.env` 里写一行 `MODE=ros` 之后 `service.sh` 就知道 `all` 包含三个服务，
+`start / stop / restart / status / logs` 都按模式来；单独管节点用
+`tools/service.sh restart nodes [launch 参数…]`。三个进程的启动顺序无所谓。
+
+ROS 模式的两个环境前提（`source /opt/ros/humble/setup.bash` 和 `python3 -s`）
+由 `run-agent.sh` / `run-ros-nodes.sh` 负责，手工起 agent 时别忘了。
 `--width/--height` 要和 launch 参数一致，见第四节「ROS 模式」。
 
 ### 公网（当前部署形态）
@@ -690,9 +694,11 @@ VPS 上：`sudo bash tools/deploy_vps.sh` 装 coturn，并生成
 那套双人通话演示不再由这台 VPS 的 8443 提供；要恢复得回 camera-pipeline 项目单独部署。
 
 板子上：填好 `.env`（`ROOM`、`TOKEN`、`SIGNAL_HOST`、`SIGNAL_AUTH`）后用
-`tools/service.sh start` 起两个服务（`start|stop|restart|status|logs`，进程在
-`run/*.pid`，日志在 `run/*.log`）。`tools/run-agent.sh` / `tools/run-web.sh` 仍然
-可用，但它们是**前台**进程，适合调试。两个入口都从 `.env` 读，`SIGNAL_AUTH`
+`tools/service.sh start` 起当前模式需要的服务（`start|stop|restart|status|logs`，
+进程在 `run/*.pid`，日志在 `run/*.log`）。monitor 模式是 `web + agent`，
+ROS 模式再加 `nodes`，由 `.env` 里的 `MODE=` 决定。`tools/run-agent.sh` /
+`tools/run-web.sh` / `tools/run-ros-nodes.sh` 仍然可用，但它们是**前台**进程，
+适合调试。这些入口都从 `.env` 读，`SIGNAL_AUTH`
 必须和 VPS 上部署脚本打印的那组观看端凭证一致 ——
 板子替浏览器访问 VPS 的 `/ice.json`、`/diag`、`/ws/view` 时要带上它。
 直接传命令行参数也可以，但 `.env` 是唯一推荐方式（两边不会写岔）。
